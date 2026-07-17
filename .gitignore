@@ -1,0 +1,24 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ipynb_checkpoints/
+
+# profiler output — large, machine-specific binaries
+*.ncu-rep
+*.nsys-rep
+*.sqlite
+
+# results caches (keep the committed figures/tables, not raw dumps)
+results/traces/*
+!results/traces/.gitkeep
+results/*.csv
+results/*.pkl
+
+# env / secrets
+.env
+*.token
+
+# OS
+.DS_Store

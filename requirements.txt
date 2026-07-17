@@ -1,0 +1,21 @@
+# GPU box only (CUDA + Linux). None of this installs/runs on macOS.
+# On the GPU box: python3.11 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
+# Install torch FIRST via the CUDA-specific index (see RUNBOOK.md) — the line below
+# is a placeholder that pip will resolve to *some* torch build, which may not match
+# your CUDA version. Do not rely on it alone.
+torch
+# triton is bundled with recent Linux CUDA torch wheels. Only uncomment/install
+# separately if `python -c "import triton; print(triton.__version__)"` fails
+# after installing torch.
+# triton
+transformers
+datasets
+einops
+numpy
+pandas
+matplotlib
+tqdm
+pytest
+
+# optional
+# wandb
