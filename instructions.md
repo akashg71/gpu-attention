@@ -42,6 +42,34 @@ Result line for specifics.*
     reference notes on kernel theory + cloud/GPU-infra mechanics learned
     while deploying.
 
+### Issues found & fixed during Phase 0
+
+- [x] **Bug: Triton kernel was slower than naive** (8.11ms vs 2.54ms,
+      batch=2/heads=8/seq_len=1024/head_dim=64, fp16)
+  - Root cause: kernel had zero autotuning — hardcoded `BLOCK_M=BLOCK_N=64`,
+    default `num_warps`/`num_stages`, never tuned for the actual GPU.
+  - Fix: added `@triton.autotune` over 7 configs to `_fwd_kernel`.
+  - Result: 3.22ms (~2.5x faster). Still behind naive at this specific shape
+    — open question, see Phase 1/2 below.
+- [x] **Bug: peak memory reading contaminated by autotuning warmup**
+  - Symptom: after adding autotuning, Triton's reported peak memory jumped
+    0.016GB → 0.266GB — worse than naive, contradicting the whole point of
+    the kernel.
+  - Root cause: `torch.cuda.reset_peak_memory_stats()` ran *before* warmup in
+    `benchmark.py`, and warmup is when the autotuning search happens —
+    Triton's autotuner allocates its own scratch buffer to benchmark
+    candidate configs fairly, and that one-time allocation was getting
+    counted as steady-state memory.
+  - Fix: split warmup out of `_time_cuda()` into its own `_warmup()` step so
+    the reset happens after one-time costs settle.
+  - Result: confirmed — peak memory returned to 0.016GB, exactly matching
+    SDPA, after the fix.
+- [ ] **Known gap, not yet fixed: GPU clocks not locked**
+  - ~20% run-to-run variance observed in SDPA's measured TFLOP/s across 3
+    separate runs (7.71 → 6.92 → 6.01). Brief explicitly calls for locking
+    clocks to reduce this (Section 4.3). Flagged, not addressed — should be
+    fixed before Phase 2's sweep numbers are treated as final.
+
 ## 0. TL;DR — what I want from you in THIS first session
 The folder is empty. Do this and stop:
 1. Confirm the GPU environment (print GPU name, CUDA version, torch version, Triton version).
