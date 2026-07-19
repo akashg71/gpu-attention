@@ -33,15 +33,29 @@ class BenchResult:
     peak_mem_gb: float
 
 
-def _time_cuda(fn: Callable[[], torch.Tensor], warmup: int = 10, iters: int = 50) -> float:
-    """Median latency in ms over `iters` runs, timed with CUDA events.
-    Warms up first so the first-call kernel-compile/cache cost (Triton
-    autotuning, cuDNN algo search, etc.) doesn't pollute the measurement.
+def _warmup(fn: Callable[[], torch.Tensor], iters: int = 10) -> None:
+    """Runs fn() `iters` times and synchronizes, with no timing or memory
+    tracking. Split out from _time_cuda as its own step so one-time costs —
+    Triton JIT compilation, its autotuning search over _CONFIGS, cuDNN
+    algorithm search — complete and are discarded *before* peak-memory
+    tracking starts in bench_one(). Autotuning in particular allocates its
+    own internal scratch buffer to benchmark candidate configs fairly; if
+    peak-memory tracking were active during that search, it would count a
+    one-time setup allocation as if it were the kernel's steady-state memory
+    footprint (this is exactly what inflated Triton's reported peak memory
+    from 0.016GB to 0.266GB after autotuning was added — the reset was
+    happening before this warmup, not after).
     """
-    for _ in range(warmup):
+    for _ in range(iters):
         fn()
     torch.cuda.synchronize()
 
+
+def _time_cuda(fn: Callable[[], torch.Tensor], iters: int = 50) -> float:
+    """Median latency in ms over `iters` runs, timed with CUDA events.
+    Assumes warmup (see _warmup) has already happened — does not warm up
+    itself, so it can be called after peak-memory tracking has been reset.
+    """
     times = []
     for _ in range(iters):
         start = torch.cuda.Event(enable_timing=True)
@@ -66,6 +80,7 @@ def bench_one(
     causal: bool,
     device: torch.device,
 ) -> BenchResult:
+    _warmup(fn)
     torch.cuda.reset_peak_memory_stats(device)
     latency_ms = _time_cuda(fn)
     peak_mem_gb = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
