@@ -6,6 +6,42 @@
 
 ---
 
+## Progress Log
+
+*Added by Claude Code to track actual progress against this brief. Checkboxes
+reflect what's actually been done and verified, not what's planned — see each
+Result line for specifics.*
+
+### Phase 0 — Env + smoke
+
+- [x] **Confirm GPU environment** (Section 0, step 1)
+  - Result: Tesla T4, driver reports CUDA 13.0, toolkit 12.9, Python 3.10.12,
+    torch 2.13.0+cu130, triton 3.7.1. Runs on a rented GCP Compute Engine box
+    (local dev machine is a Mac, no CUDA — see infra notes at the bottom).
+- [x] **Initialise git repo + create structure** (Section 3)
+  - Result: done, matches the spec. Pushed to
+    `github.com/akashg71/gpu-attention` (public).
+- [x] **requirements.txt + install deps**
+  - Result: installed in a venv (Python 3.10) on the GPU box. `pip install
+    torch` alone picked up a CUDA-matched build (cu130) — no manual index URL
+    needed on this box.
+- [x] **One fused-attention Triton kernel running, validated vs PyTorch
+      reference on one shape**
+  - Result: **PASS**. `max_abs_err=0.000610` (fp16, shape
+    batch=2/heads=4/seq_len=512/head_dim=64, non-causal). The kernel needed
+    zero API changes against Triton 3.7.1 despite being written blind
+    (no GPU available while writing it) — the only fix needed was an
+    environment issue (missing `python3-dev`/`Python.h`, required for
+    Triton's JIT C-compile step), not a kernel bug.
+- [x] **Stub benchmark harness (naive vs SDPA vs Triton) runs on one shape**
+  - Result: runs. See "Issues found & fixed" below — the first run's numbers
+    were misleading and needed two follow-up fixes before they were
+    trustworthy.
+- [x] **README.md + RUNBOOK.md written**
+  - Result: done. Also added `concepts.md` (not originally scoped) — running
+    reference notes on kernel theory + cloud/GPU-infra mechanics learned
+    while deploying.
+
 ## 0. TL;DR — what I want from you in THIS first session
 The folder is empty. Do this and stop:
 1. Confirm the GPU environment (print GPU name, CUDA version, torch version, Triton version).
