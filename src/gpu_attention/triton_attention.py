@@ -1,23 +1,18 @@
 """
 Fused (FlashAttention-style) attention forward pass, in Triton.
 
-*** STATUS: UNVERIFIED. This file has never been run. ***
-It was written on a Mac with no CUDA GPU and no Triton installed, so it could
-not be compiled, executed, or checked against the reference. Triton's kernel
-API also changes between versions (this is called out explicitly in
-instructions.md), and there was no installed version here to check against.
-
-Before trusting ANYTHING below:
-1. On the GPU box, run `python -c "import triton; print(triton.__version__)"`
-   and open that version's own tutorial (`06-fused-attention` in
-   github.com/triton-lang/triton, tag matched to your version).
-2. Run scripts/00_smoke_test.py. Expect this to fail or need fixes on first
-   try — that's the actual Phase 0 work, not a sign anything is broken.
-3. Common breakage points to check against the real tutorial: `tl.dot`
-   signature/accumulator dtype, whether `tl.make_block_ptr` is expected instead
-   of raw pointer arithmetic (used below for stability across versions), and
-   `libdevice`/`tl.math` exp namespace (`tl.exp` vs `tl.math.exp` vs
-   `triton.language.extra.libdevice.exp`).
+STATUS: correctness verified on a real GPU (Tesla T4, driver CUDA 13.0,
+Triton 3.7.1) — see scripts/00_smoke_test.py, which passes torch.allclose
+within fp16 tolerance. Performance was NOT fine on the first pass: this
+kernel initially had no autotuning and lost to the naive PyTorch baseline
+(8.11ms vs 2.54ms at batch=2,heads=8,seq_len=1024,head_dim=64,fp16) — the
+opposite of the point of the project. Root cause was structural, not a
+one-off: BLOCK_M/BLOCK_N and num_warps/num_stages were hardcoded guesses,
+never tuned for the actual GPU. Fixed below via `@triton.autotune`. If
+performance regresses again after future edits, re-run
+scripts/02_benchmark.py before assuming anything else is wrong — and note
+that *why* a given config wins (occupancy, register pressure, etc.) is
+Phase 3's job via `ncu`, not something to reason out from source alone.
 
 Deliberately uses raw pointer + stride arithmetic instead of `make_block_ptr`,
 since that calling convention has been more stable across Triton releases and
@@ -36,7 +31,25 @@ import torch
 import triton
 import triton.language as tl
 
+# Spread of tile sizes / warp counts / pipeline depths to search over. None of
+# these is guaranteed optimal on any given GPU — that's the point of
+# autotuning rather than hardcoding one guess. Kept deliberately small
+# (7 configs) so the one-time search per seq_len stays fast; includes
+# smaller-tile, fewer-stage options since T4 (sm75) has less shared
+# memory/register budget per SM than the A100-class cards most Triton
+# examples are implicitly tuned against.
+_CONFIGS = [
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, num_stages=1),
+    triton.Config({"BLOCK_M": 64, "BLOCK_N": 32}, num_warps=4, num_stages=3),
+    triton.Config({"BLOCK_M": 32, "BLOCK_N": 64}, num_warps=4, num_stages=3),
+    triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 32}, num_warps=4, num_stages=2),
+]
 
+
+@triton.autotune(configs=_CONFIGS, key=["N_CTX"])
 @triton.jit
 def _fwd_kernel(
     Q, K, V, Out,
@@ -128,14 +141,16 @@ def triton_attention(
     k: torch.Tensor,
     v: torch.Tensor,
     causal: bool = False,
-    block_m: int = 64,
-    block_n: int = 64,
 ) -> torch.Tensor:
     """Fused attention forward. q, k, v: (batch, heads, seq, head_dim), same
     dtype/device, head_dim a power of 2 (required so BLOCK_D covers it exactly
     with no tiling — this kernel does not tile the head_dim, only Q's seq and
     K/V's seq, which matches the tutorial's default and is fine for the
-    head_dim=64/128 shapes used here).
+    head_dim=64/128 shapes used here). BLOCK_M/BLOCK_N/num_warps/num_stages
+    are chosen by @triton.autotune on _fwd_kernel, not exposed as arguments
+    here — the first call for a new seq_len benchmarks every config in
+    _CONFIGS once (expect it to be slower than subsequent calls; that's the
+    search happening, not a hang), then caches the winner.
     """
     assert q.shape == k.shape == v.shape, "q, k, v must have matching shapes"
     batch, heads, seq_len, head_dim = q.shape
@@ -147,7 +162,7 @@ def triton_attention(
     out = torch.empty_like(q)
     scale = 1.0 / (head_dim ** 0.5)
 
-    grid = (triton.cdiv(seq_len, block_m), batch * heads)
+    grid = lambda META: (triton.cdiv(seq_len, META["BLOCK_M"]), batch * heads)
 
     _fwd_kernel[grid](
         q, k, v, out,
@@ -157,8 +172,6 @@ def triton_attention(
         out.stride(0), out.stride(1), out.stride(2), out.stride(3),
         heads, seq_len,
         scale,
-        BLOCK_M=block_m,
-        BLOCK_N=block_n,
         BLOCK_D=head_dim,
         CAUSAL=causal,
     )
