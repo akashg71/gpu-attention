@@ -70,6 +70,26 @@ Result line for specifics.*
     clocks to reduce this (Section 4.3). Flagged, not addressed — should be
     fixed before Phase 2's sweep numbers are treated as final.
 
+### Latest single-shape benchmark
+
+batch=2, heads=8, seq_len=1024, head_dim=64, fp16, non-causal — after both
+fixes above:
+
+| impl   | latency (ms) | TFLOP/s | peak mem (GB) |
+|--------|-------------:|--------:|--------------:|
+| naive  | 2.566        | 1.67    | 0.170         |
+| sdpa   | 0.715        | 6.01    | 0.016         |
+| triton | 3.224        | 1.33    | 0.016         |
+
+Memory story now matches the thesis cleanly (naive ~10x Triton/SDPA — O(N²)
+vs O(N) intermediate). Latency story doesn't yet — Triton still behind naive,
+open question for the Phase 2 sweep (hypothesis: at seq_len=1024, naive's
+O(N²) intermediate is still cheap enough that FlashAttention's advantage
+hasn't kicked in — untested).
+
+**Phase 0 status: DONE** — every item in Section 6's definition of done is
+met.
+
 ## 0. TL;DR — what I want from you in THIS first session
 The folder is empty. Do this and stop:
 1. Confirm the GPU environment (print GPU name, CUDA version, torch version, Triton version).
