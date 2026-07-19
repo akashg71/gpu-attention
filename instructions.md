@@ -90,6 +90,43 @@ hasn't kicked in — untested).
 **Phase 0 status: DONE** — every item in Section 6's definition of done is
 met.
 
+### Phase 1 — Correct kernel
+
+- [ ] Not started. `scripts/01_correctness.py` is currently a stub
+  (`raise NotImplementedError`). Next up: sweep `check_one()` across seq_len,
+  head_dim, batch, causal on/off, fp16/bf16.
+
+### Phase 2 — Benchmark
+
+- [ ] Not started.
+
+### Phase 3 — Profile
+
+- [ ] Not started.
+
+### Phase 4 — Extension
+
+- [ ] Not started. Not yet decided: KV-cache (4a) vs quantization (4b).
+
+### Phase 5 — Writeup
+
+- [ ] Not started.
+
+### Infra notes (for reference)
+
+- Local dev machine: macOS (Apple Silicon), no CUDA — all GPU work runs on a
+  rented box, never locally.
+- GPU box: GCP Compute Engine, project `project-9d8f69e0-e809-4fab-b37`,
+  instance `instance-20260718-143824`, zone `europe-west2-b`, **Spot**
+  provisioning, Tesla T4, Deep Learning VM image (Ubuntu 22.04 + CUDA 12.9).
+- Repo: `github.com/akashg71/gpu-attention` (public).
+- Connect: `gcloud compute ssh akashg7171_com@instance-20260718-143824` — this
+  exact username, which differs from the local Mac's gcloud-derived username
+  (`akashgupta`) and owns the actual clone/venv on the box.
+- Cost control: `gcloud compute instances stop/start instance-20260718-143824`
+  between sessions — Spot billing is per-second while running only; the disk
+  (and everything on it) persists regardless of running state.
+
 ## 0. TL;DR — what I want from you in THIS first session
 The folder is empty. Do this and stop:
 1. Confirm the GPU environment (print GPU name, CUDA version, torch version, Triton version).
