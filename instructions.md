@@ -92,9 +92,35 @@ met.
 
 ### Phase 1 — Correct kernel
 
-- [ ] Not started. `scripts/01_correctness.py` is currently a stub
-  (`raise NotImplementedError`). Next up: sweep `check_one()` across seq_len,
-  head_dim, batch, causal on/off, fp16/bf16.
+- [x] **Implement and run the correctness sweep** (Section 4.2: seq_len,
+      head_dim, batch, causal on/off, fp16/bf16)
+  - Grid: `seq_len ∈ {128, 512, 1024, 2048, 4096}`, `head_dim ∈ {64, 128}`,
+    `batch ∈ {1, 4}`, `causal ∈ {False, True}`, `dtype ∈ {fp16, bf16}` — 80
+    combinations, each isolated in try/except so one bad combo can't crash
+    the whole sweep.
+  - Result: **80/80 PASS** on the GPU box.
+  - Correction to a concern raised while writing this: expected the 40 bf16
+    combinations might fail to compile, since T4 (Turing/sm75) lacks native
+    bf16 tensor-core support (that arrived with Ampere). They didn't fail —
+    all passed. This only shows bf16 is *correct* here, not that it's
+    *efficient* — untested, and not assumed either way.
+  - Error pattern, and why it's informative rather than just numbers: fp16
+    non-causal error shrinks as seq_len grows (0.000977 at N=128 → 0.000244
+    at N=4096) because softmax over more keys spreads weight thinner,
+    shrinking output magnitude, and absolute error tracks magnitude. Causal
+    error instead sits at an exact constant (`0.001953125` fp16 = 2⁻⁹,
+    `0.015625` bf16 = 2⁻⁶) almost everywhere — the first row in a causal
+    block attends to ~1 key, so softmax there degenerates to copying a V
+    value through dtype rounding, a fixed floor independent of seq_len.
+- [x] **Found and closed a gap in the sweep's own coverage**
+  - Every seq_len in the original grid was a power of 2, dividing evenly
+    into every autotune block size (32/64/128) — meaning `_fwd_kernel`'s
+    boundary-masking code (the `mask=...` args for when seq_len isn't a
+    multiple of the block size) had never actually been exercised, despite
+    80/80 passing.
+  - Fix: added `seq_len=1000` to the grid (deliberately not a multiple of
+    32, 64, or 128).
+  - Result: pending re-run on the GPU box.
 
 ### Phase 2 — Benchmark
 
