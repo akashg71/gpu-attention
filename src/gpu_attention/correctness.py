@@ -32,6 +32,7 @@ class CorrectnessResult:
     shape: tuple
     dtype: torch.dtype
     causal: bool
+    error: str = ""
 
 
 def check_one(
@@ -67,3 +68,52 @@ def check_one(
         dtype=dtype,
         causal=causal,
     )
+
+
+# Sweep grid for Phase 1 (instructions.md Section 4.2: seq len, head dim,
+# batch, causal on/off, fp16/bf16). Heads is fixed, not swept — the brief
+# doesn't list it as an axis and it doesn't interact with tile/tolerance
+# logic the way these five do.
+SEQ_LENS = (128, 512, 1024, 2048, 4096)
+HEAD_DIMS = (64, 128)
+BATCHES = (1, 4)
+CAUSALS = (False, True)
+DTYPES = (torch.float16, torch.bfloat16)
+SWEEP_HEADS = 8
+
+
+def run_sweep(device: torch.device) -> list[CorrectnessResult]:
+    """Runs check_one() over the full grid above. Each combination is
+    isolated in its own try/except: a single shape/dtype combo raising
+    (e.g. bf16 matmul on a GPU without bf16 tensor-core support) is recorded
+    as a failure with the error message, not allowed to crash the whole
+    sweep and lose every result gathered so far.
+    """
+    results = []
+    for seq_len in SEQ_LENS:
+        for head_dim in HEAD_DIMS:
+            for batch in BATCHES:
+                for causal in CAUSALS:
+                    for dtype in DTYPES:
+                        try:
+                            result = check_one(
+                                batch=batch,
+                                heads=SWEEP_HEADS,
+                                seq_len=seq_len,
+                                head_dim=head_dim,
+                                causal=causal,
+                                dtype=dtype,
+                                device=device,
+                            )
+                        except Exception as e:
+                            result = CorrectnessResult(
+                                passed=False,
+                                max_abs_err=float("nan"),
+                                max_rel_err=float("nan"),
+                                shape=(batch, SWEEP_HEADS, seq_len, head_dim),
+                                dtype=dtype,
+                                causal=causal,
+                                error=str(e).splitlines()[0][:200],
+                            )
+                        results.append(result)
+    return results
