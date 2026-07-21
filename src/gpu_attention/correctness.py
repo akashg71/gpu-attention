@@ -74,7 +74,12 @@ def check_one(
 # batch, causal on/off, fp16/bf16). Heads is fixed, not swept — the brief
 # doesn't list it as an axis and it doesn't interact with tile/tolerance
 # logic the way these five do.
-SEQ_LENS = (128, 512, 1024, 2048, 4096)
+#
+# 1000 is deliberately not a multiple of any BLOCK_M/BLOCK_N in _CONFIGS
+# (32/64/128) — every other value here is a power of 2, so without this the
+# boundary-masking code in _fwd_kernel (the mask=... arguments handling a
+# seq_len that doesn't divide evenly into a block) would never actually run.
+SEQ_LENS = (128, 512, 1000, 1024, 2048, 4096)
 HEAD_DIMS = (64, 128)
 BATCHES = (1, 4)
 CAUSALS = (False, True)
