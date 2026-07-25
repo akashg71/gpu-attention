@@ -95,7 +95,31 @@ one fixed shape (batch=2, heads=8, seq_len=1024, head_dim=64, fp16). Don't
 read anything into the numbers yet — this is the harness working, not a
 result to report. Phase 2 does the real sweep.
 
-## 5. Nsight tools (Phase 3 only — not needed yet)
+## 5. Reducing benchmark variance (do this before Phase 2's real sweep)
+
+Phase 0 runs showed SDPA's measured TFLOP/s swing ~20% across three separate
+runs of the nominally-same shape (7.71 → 6.92 → 6.01). That's GPU clock
+boost/throttle variance, not measurement error, and the brief calls out
+locking clocks explicitly (Section 4.3). Do this before treating any Phase 2
+numbers as final — not required to just get a first look at the sweep
+working.
+
+```bash
+nvidia-smi -q -d SUPPORTED_CLOCKS | less   # find valid graphics clock values for this GPU
+sudo nvidia-smi -pm 1                       # enable persistence mode
+sudo nvidia-smi -lgc <MAX_GRAPHICS_CLOCK>   # lock to the highest listed value
+```
+
+Run the benchmark script(s) while locked. When done:
+```bash
+sudo nvidia-smi -rgc                        # reset clocks to default
+```
+
+Note: this is a Spot VM — losing the instance to preemption or stopping it
+resets any driver-level clock lock, so this needs re-doing each session, not
+just once.
+
+## 6. Nsight tools (Phase 3 only — not needed yet)
 
 ```bash
 which ncu nsys   # check if already on the box (common on cloud GPU images)
@@ -111,7 +135,7 @@ sudo apt update && sudo apt install -y nsight-compute nsight-systems
 don't burn time trying to get Phase 3 working on the free tier, move to a
 rented box with sudo for this phase.
 
-## 6. Common gotchas
+## 7. Common gotchas
 
 - **`torch.cuda.is_available()` is False**: wrong torch build (CPU-only) or
   no GPU attached to the instance. Re-check step 2's install command.
