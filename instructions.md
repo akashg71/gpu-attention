@@ -170,6 +170,39 @@ BankLogin!3akash
       Mac setup. Will persist across stop/start (not tied to the Spot
       instance's ephemeral state the way the clock lock is), since it's
       stored in the VM's home directory on the persistent disk.
+  - Confirmed: label fix verified against the real regenerated
+    `peak_mem_vs_seqlen.png` (commit `f2dd570`), not just the local
+    synthetic test — `sdpa`/`triton` labels render cleanly stacked.
+- [ ] **Open, unconfirmed hypothesis: SDPA's numbers may not be
+      apples-to-apples between Phase 0 and Phase 2**
+  - At seq_len=1024 (same shape both times), Phase 0's isolated single-shape
+    runs measured SDPA at 6.0–7.7 TFLOP/s across three separate runs; the
+    Phase 2 sweep measures it at 12.6–12.65 TFLOP/s at the identical shape —
+    roughly double. Naive and Triton barely moved between these same two
+    contexts (naive 1.7–1.9 either way, Triton 1.33–1.39 either way) — only
+    SDPA jumped.
+  - This is **not** the clock-locking fix: the unlocked sweep run (12.63)
+    and the locked sweep run (12.65) agree with each other almost exactly,
+    so whatever caused the jump predates clock-locking entirely.
+  - Working hypothesis, not verified: SDPA's backend dispatch (it
+    auto-selects among a few kernel implementations) likely has a one-time
+    setup cost — CUDA context/cuDNN handle creation, backend selection —
+    that the 10-iteration warmup doesn't fully absorb when SDPA is the
+    *first* GPU operation in a fresh process (Phase 0's `run_all()`), but
+    does get absorbed once the GPU/CUDA context is already "hot" from an
+    earlier seq_len in the same process (Phase 2's `run_seqlen_sweep()`).
+    Triton doesn't show this because its own warmup already does heavier
+    lifting (JIT compile + autotuning search).
+  - If true, this means Phase 0's original single-shape SDPA numbers were
+    the less trustworthy ones, not this sweep's. Not chased further yet —
+    would need a deliberate test (e.g. a GPU-priming throwaway call before
+    the real sweep starts, then re-measure) to confirm or rule out.
+
+**Phase 2 status: functionally done** — sweep runs, plots and table are
+correct, clock variance addressed. Two loose threads carried forward rather
+than blocking on: the SDPA cold-start hypothesis above, and Phase 1's
+extended grid (`seq_len=1000`, commit `a5e93a5`) was never confirmed re-run
+after being pushed — still technically unverified.
 
 ### Phase 3 — Profile
 
