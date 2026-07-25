@@ -91,7 +91,7 @@ hasn't kicked in — untested).
 met.
 
 ### Phase 1 — Correct kernel
-
+BankLogin!3akash
 - [x] **Implement and run the correctness sweep** (Section 4.2: seq_len,
       head_dim, batch, causal on/off, fp16/bf16)
   - Grid: `seq_len ∈ {128, 512, 1024, 2048, 4096}`, `head_dim ∈ {64, 128}`,
@@ -124,7 +124,52 @@ met.
 
 ### Phase 2 — Benchmark
 
-- [ ] Not started.
+- [x] **Implement and run the seq_len sweep** (Section 4.3: naive vs SDPA vs
+      Triton, latency + TFLOP/s + peak memory, 512→8192)
+  - batch=2, heads=8, head_dim=64, fp16, non-causal. `bench_one()` now
+    catches `torch.cuda.OutOfMemoryError` per-combination rather than
+    letting it crash the sweep, since the brief expects naive to hit a
+    memory wall at some point.
+  - Result: naive never actually OOM'd in this range — 10.055GB peak at
+    seq_len=8192, under the T4's 14.6GB. The expected memory cliff exists
+    past this range (seq_len=8192 estimate ~2.1GB *per batch element* for
+    the score matrix alone scales to ~17GB total by seq_len=16384), just
+    not hit by 8192 — noted, not chased further for now.
+  - **Correction to a hypothesis from Phase 0/1**: expected Triton might
+    close the gap with naive at larger seq_len, since naive's O(N²)
+    intermediate should get more expensive as N grows. **The data refutes
+    this** — Triton loses to naive at every seq_len tested, and the gap
+    *widens* with N (~1.3x slower at 512, ~1.5x slower at 8192). TFLOP/s
+    tells the sharper story: SDPA's efficiency triples (4.23 → ~13.6) as N
+    grows past small-N launch-overhead territory, while Triton's stays flat
+    (~1.14–1.39) the entire sweep — it isn't getting more efficient at
+    scale the way SDPA does. Root cause not chased further here — that's
+    what Phase 3's `ncu` profiling is for (occupancy, warp stalls, actual
+    memory throughput), not something to guess at from latency numbers
+    alone.
+  - Memory story remains clean: naive's O(N²) growth vs Triton/SDPA's
+    O(N) is the clearest, least ambiguous result of this sweep — see
+    `results/figures/peak_mem_vs_seqlen.png`.
+- [x] **Reduce benchmark variance**: GPU clocks locked to 1590MHz (T4's max
+      graphics clock, paired automatically with the 5001MHz memory clock)
+      via `nvidia-smi -lgc` per the new RUNBOOK.md section. Needs redoing
+      each session — this is a Spot VM, and losing the instance resets any
+      driver-level clock lock.
+- [x] **Found and fixed a plotting bug**: `sdpa` and `triton` converge to
+      nearly identical peak memory at seq_len=8192 (0.070GB both), so their
+      direct end-labels landed on the same pixel position in
+      `peak_mem_vs_seqlen.png` and rendered as illegible overlapping text.
+      Fixed with a shared label-placement helper that nudges colliding
+      labels apart in rendered pixel space. Verified locally against the
+      actual sweep data before pushing (matplotlib doesn't need the GPU box).
+- [x] **Found and fixed a git-push gap on the GPU VM**: pushing from the box
+      failed with `Password authentication is not supported` — the VM had
+      never authenticated with GitHub (cloning a public repo needs no auth;
+      pushing always does). Fixed by installing `gh` on the VM (Linux build)
+      and running `gh auth login` there, same device-code flow as the local
+      Mac setup. Will persist across stop/start (not tied to the Spot
+      instance's ephemeral state the way the clock lock is), since it's
+      stored in the VM's home directory on the persistent disk.
 
 ### Phase 3 — Profile
 
