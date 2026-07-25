@@ -196,6 +196,41 @@ def write_results_markdown(results: list[BenchResult], path: str) -> None:
         f.write("\n".join(lines) + "\n")
 
 
+def _place_end_labels(ax, entries: list[tuple], min_gap_px: float = 14.0) -> None:
+    """Places a direct text label at each (name, x, y, color) point, nudging
+    labels apart in *display* (pixel) space when two series' last values are
+    close enough to collide — e.g. sdpa and triton converging to nearly
+    identical peak memory at large seq_len, which without this renders as
+    illegible overlapping text regardless of how far apart the underlying
+    data actually is in axis units. Works for both log and linear axes since
+    it compares rendered pixel positions, not raw data values.
+    """
+    fig = ax.figure
+    px_per_point = fig.dpi / 72.0
+
+    # Sort by rendered pixel y so collisions are resolved in on-screen order.
+    with_px = []
+    for name, x, y, color in entries:
+        _, py = ax.transData.transform((x, y))
+        with_px.append([name, x, y, color, py])
+    with_px.sort(key=lambda e: e[4])
+
+    last_py = None
+    for entry in with_px:
+        py = entry[4]
+        if last_py is not None and py - last_py < min_gap_px:
+            py = last_py + min_gap_px
+            entry[4] = py
+        last_py = py
+
+    for name, x, y, color, target_py in with_px:
+        _, orig_py = ax.transData.transform((x, y))
+        offset_points = (target_py - orig_py) / px_per_point
+        ax.annotate(name, xy=(x, y), xycoords="data",
+                    xytext=(6, offset_points), textcoords="offset points",
+                    fontsize=9, color=color, va="center")
+
+
 def plot_latency_vs_seqlen(results: list[BenchResult], path: str) -> None:
     """Log-log latency plot. Log-log is deliberate, not decorative: it makes
     polynomial scaling visible as a straight line whose slope is the
@@ -211,26 +246,26 @@ def plot_latency_vs_seqlen(results: list[BenchResult], path: str) -> None:
     fig, ax = plt.subplots(figsize=(7, 5), facecolor="#fcfcfb")
     ax.set_facecolor("#fcfcfb")
 
+    end_labels = []
     for name in ("naive", "sdpa", "triton"):
         xs = [r.seq_len for r in results if r.name == name]
         ys = [r.latency_ms for r in results if r.name == name]
         ax.plot(xs, ys, marker="o", markersize=5, linewidth=2,
                  color=colors[name], label=name)
 
-        # Direct end-label — required mitigation for the magenta slot's
-        # light-surface contrast, and just generally clearer than legend-only.
         valid = [(x, y) for x, y in zip(xs, ys) if y == y]  # drop NaNs (OOM)
         if valid:
             last_x, last_y = valid[-1]
-            ax.annotate(name, (last_x, last_y), textcoords="offset points",
-                        xytext=(6, 0), fontsize=9, color=colors[name], va="center")
+            end_labels.append((name, last_x, last_y, colors[name]))
 
         # Explicitly mark where a series stops (OOM), rather than letting it
         # silently vanish from the line.
-        if len(valid) < len(xs):
+        if valid and len(valid) < len(xs):
             ax.annotate("OOM beyond this point", (last_x, last_y),
                         textcoords="offset points", xytext=(6, -14),
                         fontsize=8, color="#898781", style="italic")
+
+    _place_end_labels(ax, end_labels)
 
     ax.set_xscale("log", base=2)
     ax.set_yscale("log")
@@ -263,6 +298,7 @@ def plot_peakmem_vs_seqlen(results: list[BenchResult], path: str) -> None:
     fig, ax = plt.subplots(figsize=(7, 5), facecolor="#fcfcfb")
     ax.set_facecolor("#fcfcfb")
 
+    end_labels = []
     for name in ("naive", "sdpa", "triton"):
         xs = [r.seq_len for r in results if r.name == name]
         ys = [r.peak_mem_gb for r in results if r.name == name]
@@ -271,8 +307,9 @@ def plot_peakmem_vs_seqlen(results: list[BenchResult], path: str) -> None:
         valid = [(x, y) for x, y in zip(xs, ys) if y == y]
         if valid:
             last_x, last_y = valid[-1]
-            ax.annotate(name, (last_x, last_y), textcoords="offset points",
-                        xytext=(6, 0), fontsize=9, color=colors[name], va="center")
+            end_labels.append((name, last_x, last_y, colors[name]))
+
+    _place_end_labels(ax, end_labels)
 
     ax.set_xscale("log", base=2)
     ax.set_xticks(list(SEQ_LEN_SWEEP))
