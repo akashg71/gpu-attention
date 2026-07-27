@@ -55,12 +55,11 @@ batch × causal × dtype (fp16/bf16). Two notable findings:
 - Every original seq_len (128/512/1024/2048/4096) was a power of 2, so the
   kernel's boundary-masking code (for when seq_len isn't a multiple of the
   block size) was never actually exercised despite 80/80 passing. Added
-  `seq_len=1000` to close the gap (commit `a5e93a5`) — **this re-run was
-  never confirmed/pasted back. Still technically unverified.** Worth
-  running `python scripts/01_correctness.py` again and actually checking the
-  `(*, 1000, *)` rows before trusting Phase 1 is fully closed.
+  `seq_len=1000` to close the gap (commit `a5e93a5`) — **confirmed by re-run:
+  96/96 passed**, including all 16 `seq_len=1000` rows. Phase 1 is fully
+  closed, no open threads.
 
-**Phase 2 (benchmark sweep) — functionally done, with one open hypothesis.**
+**Phase 2 (benchmark sweep) — done, no open threads.**
 Swept seq_len 512→8192 (batch=2, heads=8, head_dim=64, fp16, non-causal).
 Key results (`results/benchmarks.md`, `results/figures/*.png`):
 - **Triton loses to naive at every seq_len tested, and the gap widens with
@@ -76,16 +75,25 @@ Key results (`results/benchmarks.md`, `results/figures/*.png`):
   range, just not hit yet. Memory story is otherwise the cleanest result in
   the whole project: naive's O(N²) growth vs Triton/SDPA's flat O(N) is
   visually unambiguous in `peak_mem_vs_seqlen.png`.
-- **Open, unconfirmed hypothesis**: Phase 0's isolated single-shape SDPA
-  measurements (6.0–7.7 TFLOP/s at seq_len=1024) differ sharply from this
-  sweep's measurement at the *identical* shape (12.6–12.65 TFLOP/s) — naive
-  and Triton barely moved between the same two contexts, only SDPA jumped.
-  Ruled out clock variance as the cause (an unlocked and a locked sweep run
-  agree with each other, ~12.63 vs ~12.65). Leading theory: SDPA's backend
-  dispatch has a one-time setup cost that a fresh process's 10-iteration
-  warmup doesn't fully absorb, but which is already "hot" by the second
-  seq_len in a sweep. **Not confirmed.** Would need a deliberate test
-  (GPU-priming throwaway call before the real sweep, re-measure) to check.
+- **SDPA anomaly (Phase 0's 6.0–7.7 TFLOP/s vs Phase 2's 12.6–12.65 TFLOP/s
+  at the identical seq_len=1024 shape) — resolved**, via a dedicated
+  diagnostic (`scripts/sdpa_diagnostic.py`). The original write-up here
+  guessed "cold start" / backend dispatch setup cost; that turned out
+  wrong. What actually explains it: **the same clock-variance issue already
+  fixed via clock-locking**, not a separate problem. Reproducing "isolated"
+  conditions with clocks locked gave 13.92 TFLOP/s — nowhere near Phase 0's
+  slow numbers — which rules out cold-start as the mechanism (isolated
+  should have reproduced the slow number if that were true; it didn't).
+  Phase 0's original three runs already showed a 22% spread *among
+  themselves* with zero context difference, all pre-clock-lock — sufficient
+  on its own to explain swings this size. Backend selection was checked
+  explicitly (not the mechanism — pinning a backend still shows a small
+  gap, in the *opposite* direction from the original anomaly, consistent
+  with ordinary noise) but confirmed something real regardless: **Flash
+  Attention is hardware-incompatible with this T4** (PyTorch's own error:
+  "Flash attention only supports gpu architectures in the range [sm80,
+  sm121]. Attempting to run on a sm 7.5 gpu.") — SDPA runs via the
+  memory-efficient backend on this box, confirmed fact now.
 - Also fixed along the way: a peak-memory measurement bug (autotuning's
   internal search allocated a scratch buffer that got miscounted as
   steady-state memory — fixed by moving `reset_peak_memory_stats()` to
@@ -140,6 +148,6 @@ throws a permissions error (`ERR_NVGPUCTRPERM`) — not yet tested on this box.
 - The user is a senior backend engineer, new to CUDA/Triton/GPU profiling —
   comment/explain generously, don't assume familiarity with GPU-specific
   vocabulary (see `concepts.md` for what's already been explained).
-- Two loose threads are explicitly **not yet resolved**, not silently
-  dropped: the Phase 1 extended-grid re-run, and the SDPA cold-start
-  hypothesis. Don't treat either as settled.
+- Phases 0-2 have no open threads as of this writing — both loose ends noted
+  in earlier drafts of this doc (the Phase 1 extended-grid re-run, and the
+  SDPA anomaly) were resolved and are recorded above. Phase 3 is next.

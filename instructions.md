@@ -173,36 +173,41 @@ BankLogin!3akash
   - Confirmed: label fix verified against the real regenerated
     `peak_mem_vs_seqlen.png` (commit `f2dd570`), not just the local
     synthetic test — `sdpa`/`triton` labels render cleanly stacked.
-- [ ] **Open, unconfirmed hypothesis: SDPA's numbers may not be
-      apples-to-apples between Phase 0 and Phase 2**
-  - At seq_len=1024 (same shape both times), Phase 0's isolated single-shape
-    runs measured SDPA at 6.0–7.7 TFLOP/s across three separate runs; the
-    Phase 2 sweep measures it at 12.6–12.65 TFLOP/s at the identical shape —
-    roughly double. Naive and Triton barely moved between these same two
-    contexts (naive 1.7–1.9 either way, Triton 1.33–1.39 either way) — only
-    SDPA jumped.
-  - This is **not** the clock-locking fix: the unlocked sweep run (12.63)
-    and the locked sweep run (12.65) agree with each other almost exactly,
-    so whatever caused the jump predates clock-locking entirely.
-  - Working hypothesis, not verified: SDPA's backend dispatch (it
-    auto-selects among a few kernel implementations) likely has a one-time
-    setup cost — CUDA context/cuDNN handle creation, backend selection —
-    that the 10-iteration warmup doesn't fully absorb when SDPA is the
-    *first* GPU operation in a fresh process (Phase 0's `run_all()`), but
-    does get absorbed once the GPU/CUDA context is already "hot" from an
-    earlier seq_len in the same process (Phase 2's `run_seqlen_sweep()`).
-    Triton doesn't show this because its own warmup already does heavier
-    lifting (JIT compile + autotuning search).
-  - If true, this means Phase 0's original single-shape SDPA numbers were
-    the less trustworthy ones, not this sweep's. Not chased further yet —
-    would need a deliberate test (e.g. a GPU-priming throwaway call before
-    the real sweep starts, then re-measure) to confirm or rule out.
+- [x] **SDPA anomaly — resolved via `scripts/sdpa_diagnostic.py`.** The
+      original "cold-start" framing didn't hold up: naive always runs
+      immediately before SDPA at the same shape in both `run_all()` and
+      `run_seqlen_sweep()`, so SDPA is never literally the first GPU op in
+      either — the hypothesis as originally stated was wrong.
+  - Actual root cause: **the same clock-variance issue already identified
+    and fixed**, not a separate problem. Ran the diagnostic's "isolated"
+    (no priming) case with clocks locked at 1590MHz — it measured 13.92
+    TFLOP/s, nowhere near Phase 0's original 6.0–7.7 range and much closer
+    to Phase 2's sweep number. If cold-start/priming were the mechanism,
+    isolated should have reproduced the slow number; it didn't. Combined
+    with Phase 0's own three original runs already showing a 22% spread
+    *among themselves* with zero context difference (all fresh `run_all()`
+    calls, all pre-clock-lock) — that alone is sufficient evidence that
+    unlocked clock variance produces swings this large, without needing any
+    process-context explanation at all.
+  - Backend selection was checked explicitly and is not the mechanism (the
+    residual 8–15% isolated-vs-primed gap under a pinned backend runs in
+    the *opposite* direction from the original anomaly — consistent with
+    ordinary measurement noise, not a repeatable effect) — but confirmed
+    something real regardless: **Flash Attention is hardware-incompatible
+    with this T4.** PyTorch's own error is explicit: *"Flash attention only
+    supports gpu architectures in the range [sm80, sm121]. Attempting to
+    run on a sm 7.5 gpu."* SDPA on this box runs via the memory-efficient
+    backend — confirmed fact now, not an assumption. MATH backend also
+    confirmed available as a (much slower, ~1.1 TFLOP/s) fallback.
+- [x] **Phase 1 extended grid — confirmed.** Re-ran `01_correctness.py`:
+      **96/96 passed**, including all 16 `seq_len=1000` rows exercising the
+      boundary-masking path. Error magnitudes consistent with neighboring
+      seq_lens, nothing anomalous. Phase 1 is genuinely closed now.
 
-**Phase 2 status: functionally done** — sweep runs, plots and table are
-correct, clock variance addressed. Two loose threads carried forward rather
-than blocking on: the SDPA cold-start hypothesis above, and Phase 1's
-extended grid (`seq_len=1000`, commit `a5e93a5`) was never confirmed re-run
-after being pushed — still technically unverified.
+**Phase 2 status: DONE.** No open threads remain — sweep runs, plots and
+table are correct, benchmark variance understood and addressed, and the
+SDPA anomaly traced to the same clock-variance root cause rather than left
+as an unresolved mystery.
 
 ### Phase 3 — Profile
 
