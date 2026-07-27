@@ -1,16 +1,192 @@
 """
-Phase 3 stub — not implemented. Will emit the exact ncu/nsys command lines
-for profiling the Triton kernel vs naive, and parse the results (HBM bytes
-moved, memory throughput, occupancy, warp stalls) into results/benchmarks.md
-and the roofline plot.
+Phase 3: Nsight Compute profiling — HBM bytes moved, memory/compute
+throughput, roofline placement for naive vs Triton.
 
-Reminder from instructions.md: ncu commonly needs elevated privileges that
-hosted notebooks (Colab/Kaggle) block. Expect to run this on a rented box
-with sudo, not the free-tier T4 used for Phases 0-2.
+*** FIRST RUN ON THIS BOX. Exact ncu CLI/metric names not yet verified
+against the installed version here — see instructions.md's own warning that
+API knowledge can be stale, same lesson as the Triton kernel itself. This
+script deliberately does NOT try to cherry-pick named metric columns; it
+dumps the raw CSV and prints every column generically, specifically so a
+wrong guess about metric names surfaces as visible real output to fix,
+rather than a silent wrong number or an opaque crash. ***
 
-Planned commands (fill in once a target kernel launch is isolated):
-    ncu --set full --metrics dram__bytes.sum,gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed \
-        -o results/traces/triton_attn python scripts/02_benchmark.py
-    nsys profile -o results/traces/timeline python scripts/02_benchmark.py
+Two modes:
+  --target {naive,sdpa,triton}  — runs a few warmup calls then ONE real call
+      of a single implementation at a fixed shape. This is what ncu wraps;
+      not meant to be run directly for its own sake.
+  (no args) — driver mode: checks ncu/nsys are present, shells out to ncu
+      for each implementation, saves raw CSV to results/traces/, prints
+      every captured column, and (if dram-bytes-like columns are found)
+      computes arithmetic intensity and plots the roofline.
+
+Prerequisites — run these checks first if unsure:
+    which ncu nsys
+    sudo -v                          # cache sudo credentials so the
+                                      # subprocess sudo call below doesn't
+                                      # hang waiting for a password prompt
+    ncu --query-metrics | grep -iE "dram__bytes|throughput|warps_active"
+                                      # confirms real metric names on this
+                                      # box if the roofline set's output
+                                      # doesn't have what's expected
+
+    python scripts/03_profile.py
 """
-raise NotImplementedError("Phase 3 — needs a rented GPU box with sudo")
+import argparse
+import csv
+import io
+import subprocess
+import sys
+
+sys.path.insert(0, "src")
+
+SHAPE = dict(batch=2, heads=8, seq_len=2048, head_dim=64)
+DTYPE_NAME = "float16"
+
+
+def run_target(name: str) -> None:
+    import torch
+
+    from gpu_attention.env import get_device
+    from gpu_attention.reference import attention_naive, attention_sdpa
+    from gpu_attention.triton_attention import triton_attention
+
+    device = get_device()
+    q = torch.randn(SHAPE["batch"], SHAPE["heads"], SHAPE["seq_len"], SHAPE["head_dim"],
+                     device=device, dtype=torch.float16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+
+    impls = {
+        "naive": lambda: attention_naive(q, k, v, causal=False),
+        "sdpa": lambda: attention_sdpa(q, k, v, causal=False),
+        "triton": lambda: triton_attention(q, k, v, causal=False),
+    }
+    fn = impls[name]
+
+    # Settle JIT compilation / autotuning search / cuBLAS algo selection
+    # BEFORE the launch(es) ncu actually captures in detail below.
+    for _ in range(3):
+        fn()
+    torch.cuda.synchronize()
+
+    fn()  # the call actually meant to be profiled
+    torch.cuda.synchronize()
+
+
+def _check_prereqs() -> bool:
+    ok = True
+    for tool in ("ncu", "nsys"):
+        found = subprocess.run(["which", tool], capture_output=True, text=True)
+        if found.returncode != 0:
+            print(f"'{tool}' not found on PATH. Install: "
+                  f"sudo apt install -y nsight-compute nsight-systems")
+            ok = False
+        else:
+            print(f"{tool}: {found.stdout.strip()}")
+    return ok
+
+
+def _run_ncu_for(target: str) -> str:
+    """Returns raw stdout (CSV) from ncu, or '' on failure (with a message
+    printed explaining what to check).
+    """
+    cmd = [
+        "sudo", "ncu", "--set", "roofline", "--csv",
+        sys.executable, __file__, "--target", target,
+    ]
+    print(f"\n$ {' '.join(cmd)}")
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+
+    if result.returncode != 0:
+        print(f"ncu exited {result.returncode} for target={target}.")
+        print("--- stderr (last 40 lines) ---")
+        print("\n".join(result.stderr.splitlines()[-40:]))
+        if "ERR_NVGPUCTRPERM" in result.stderr:
+            print("\nPermission error — GPU performance counters need root.")
+            print("Try: sudo -v   (cache credentials) then re-run this script.")
+            print("If that doesn't fix it, the driver's NVreg_RestrictProfilingToAdminUsers")
+            print("flag may need clearing — see RUNBOOK.md, or search that exact flag name.")
+        elif "unknown metric" in result.stderr.lower() or "--set" in result.stderr.lower():
+            print("\nPossible unrecognized metric/set name for this ncu version.")
+            print("Run: ncu --list-sets    and    ncu --query-metrics | head -50")
+            print("to see what's actually available, then adjust this script.")
+        return ""
+
+    return result.stdout
+
+
+def _parse_and_summarize(csv_text: str, label: str) -> None:
+    if not csv_text.strip():
+        print(f"{label}: no output captured.")
+        return
+
+    reader = csv.DictReader(io.StringIO(csv_text))
+    rows = list(reader)
+    if not rows:
+        print(f"{label}: CSV had no data rows — raw output may be a warning/log, not a report.")
+        print(csv_text[:500])
+        return
+
+    print(f"\n{label}: {len(rows)} kernel launch(es) captured, {len(rows[0])} columns each.")
+    print(f"Columns: {list(rows[0].keys())}")
+
+    byte_cols = [c for c in rows[0].keys() if "byte" in c.lower()]
+    if byte_cols:
+        print(f"\nColumns containing 'byte' (candidates for HBM traffic):")
+        for col in byte_cols:
+            try:
+                total = sum(float(r[col].replace(",", "")) for r in rows if r[col].strip())
+                print(f"  {col}: sum across captured launches = {total:,.0f}")
+            except ValueError:
+                print(f"  {col}: non-numeric, raw values = {[r[col] for r in rows]}")
+
+    throughput_cols = [c for c in rows[0].keys() if "throughput" in c.lower() or "pct_of_peak" in c.lower()]
+    if throughput_cols:
+        print(f"\nColumns containing 'throughput'/'pct_of_peak':")
+        for col in throughput_cols:
+            print(f"  {col}: {[r[col] for r in rows]}")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--target", choices=["naive", "sdpa", "triton"], default=None)
+    args = parser.parse_args()
+
+    if args.target:
+        run_target(args.target)
+        return
+
+    print(f"=== Phase 3 profiling driver — shape {SHAPE}, dtype {DTYPE_NAME} ===\n")
+    if not _check_prereqs():
+        print("\nFix the above before continuing — see RUNBOOK.md section 6 (Nsight tools).")
+        sys.exit(1)
+
+    import os
+    os.makedirs("results/traces", exist_ok=True)
+
+    csv_outputs = {}
+    for target in ("naive", "triton"):
+        csv_text = _run_ncu_for(target)
+        csv_outputs[target] = csv_text
+        if csv_text:
+            with open(f"results/traces/{target}_ncu.csv", "w") as f:
+                f.write(csv_text)
+            print(f"Wrote results/traces/{target}_ncu.csv")
+
+    for target, csv_text in csv_outputs.items():
+        _parse_and_summarize(csv_text, target)
+
+    print("\n=== For manual/qualitative review (warp-stall reasons, full detail) ===")
+    print(f"sudo ncu --set full -o results/traces/naive_full {sys.executable} {__file__} --target naive")
+    print(f"sudo ncu --set full -o results/traces/triton_full {sys.executable} {__file__} --target triton")
+    print("Then: ncu -i results/traces/triton_full.ncu-rep   (opens the text report)")
+    print("\n=== Timeline (Nsight Systems) ===")
+    print(f"sudo nsys profile -o results/traces/timeline {sys.executable} {__file__} --target triton")
+
+    print("\nNext: once real column names are confirmed above, tell me what you see —")
+    print("the roofline plot (roofline.plot_roofline) needs actual bytes-moved and")
+    print("achieved-FLOP/s numbers from this output, not guessed column names.")
+
+
+if __name__ == "__main__":
+    main()
