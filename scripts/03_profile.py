@@ -135,46 +135,66 @@ def _strip_ncu_noise(raw_text: str) -> str:
     return "\n".join(lines)
 
 
-def _parse_and_summarize(csv_text: str, label: str) -> None:
+# Kernels that are test-setup noise, not part of the attention computation
+# itself — torch.randn() generating Q/K/V, and (for Triton) what's very
+# likely the autotuner's internal cache-flush fill between candidate-config
+# timing trials. Excluded from every summary below.
+_NOISE_MARKERS = ("distribution_elementwise", "distribution_nullary", "FillFunctor")
+
+
+def _parse_launches(csv_text: str, label: str) -> list[dict]:
+    """ncu's CSV is long-format: one row per (kernel launch, single metric),
+    not one row per launch with metrics as columns — 'Metric Name' and
+    'Metric Value' are themselves columns. Groups by launch ID and pivots
+    each launch's metrics into a dict: {kernel_name, grid_size, block_size,
+    metrics: {name: value}}. Filters out known noise kernels.
+    """
     csv_text = _strip_ncu_noise(csv_text)
     if not csv_text.strip():
         print(f"{label}: no output captured (or it was entirely ==PROF== noise).")
-        return
+        return []
 
     reader = csv.DictReader(io.StringIO(csv_text))
     rows = list(reader)
     if not rows:
         print(f"{label}: CSV had no data rows after stripping ==PROF== lines.")
         print(csv_text[:500])
-        return
+        return []
 
-    print(f"\n{label}: {len(rows)} kernel launch(es) captured, {len(rows[0])} columns each.")
-    print(f"Columns: {list(rows[0].keys())}")
+    launches = {}
+    for r in rows:
+        lid = r.get("ID")
+        if lid not in launches:
+            launches[lid] = {
+                "kernel_name": r.get("Kernel Name", ""),
+                "grid_size": r.get("Grid Size", ""),
+                "block_size": r.get("Block Size", ""),
+                "metrics": {},
+            }
+        metric_name = r.get("Metric Name", "")
+        if metric_name:
+            launches[lid]["metrics"][metric_name] = r.get("Metric Value", "")
 
-    name_col = next((c for c in rows[0].keys() if "kernel name" in c.lower()), None)
-    if name_col:
-        from collections import Counter
-        counts = Counter(r[name_col] for r in rows)
-        print(f"\nDistinct kernels captured (this run had no --launch-skip filtering,")
-        print(f"so warmup calls are in here too, not just the one 'real' call):")
-        for kname, count in counts.most_common():
-            print(f"  {count:>4}x  {kname}")
+    all_launches = list(launches.values())
+    real_launches = [l for l in all_launches
+                      if not any(m in l["kernel_name"] for m in _NOISE_MARKERS)]
 
-    byte_cols = [c for c in rows[0].keys() if "byte" in c.lower()]
-    if byte_cols:
-        print(f"\nColumns containing 'byte' (candidates for HBM traffic):")
-        for col in byte_cols:
-            try:
-                total = sum(float(r[col].replace(",", "")) for r in rows if r[col].strip())
-                print(f"  {col}: sum across captured launches = {total:,.0f}")
-            except ValueError:
-                print(f"  {col}: non-numeric, raw values = {[r[col] for r in rows]}")
+    print(f"\n{label}: {len(rows)} metric-rows -> {len(all_launches)} distinct kernel launches "
+          f"({len(all_launches) - len(real_launches)} excluded as RNG/fill noise).")
 
-    throughput_cols = [c for c in rows[0].keys() if "throughput" in c.lower() or "pct_of_peak" in c.lower()]
-    if throughput_cols:
-        print(f"\nColumns containing 'throughput'/'pct_of_peak':")
-        for col in throughput_cols:
-            print(f"  {col}: {[r[col] for r in rows]}")
+    from collections import Counter
+    counts = Counter((l["kernel_name"][:70], l["grid_size"], l["block_size"]) for l in real_launches)
+    print("Attention-relevant kernels (name, grid size, block size):")
+    for (name, grid, block), count in counts.most_common():
+        print(f"  {count:>4}x  grid={grid:<15} block={block:<12} {name}")
+
+    if real_launches:
+        available_metrics = sorted(real_launches[0]["metrics"].keys())
+        print(f"\nMetric names available per launch ({len(available_metrics)} total):")
+        for m in available_metrics:
+            print(f"  {m}")
+
+    return real_launches
 
 
 def main():
@@ -205,7 +225,7 @@ def main():
             print(f"Wrote results/traces/{target}_ncu.csv (==PROF== noise stripped)")
 
     for target, csv_text in csv_outputs.items():
-        _parse_and_summarize(csv_text, target)
+        _parse_launches(csv_text, target)
 
     print("\n=== For manual/qualitative review (warp-stall reasons, full detail) ===")
     print(f"sudo {tools['ncu']} --set full -o results/traces/naive_full {sys.executable} {__file__} --target naive")
