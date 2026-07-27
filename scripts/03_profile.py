@@ -73,25 +73,34 @@ def run_target(name: str) -> None:
     torch.cuda.synchronize()
 
 
-def _check_prereqs() -> bool:
-    ok = True
+def _find_tools() -> dict:
+    """Resolves absolute paths for ncu/nsys in the CURRENT user's PATH, and
+    uses those absolute paths everywhere below instead of relying on sudo to
+    find them — sudo's secure_path typically doesn't include
+    /usr/local/cuda/bin even when the invoking user's own PATH does, so
+    `sudo ncu` can fail with "command not found" while plain `ncu` works
+    fine. Absolute paths sidestep that PATH-resolution difference entirely.
+    """
+    import shutil
+
+    paths = {}
     for tool in ("ncu", "nsys"):
-        found = subprocess.run(["which", tool], capture_output=True, text=True)
-        if found.returncode != 0:
+        resolved = shutil.which(tool)
+        if resolved is None:
             print(f"'{tool}' not found on PATH. Install: "
                   f"sudo apt install -y nsight-compute nsight-systems")
-            ok = False
         else:
-            print(f"{tool}: {found.stdout.strip()}")
-    return ok
+            print(f"{tool}: {resolved}")
+            paths[tool] = resolved
+    return paths
 
 
-def _run_ncu_for(target: str) -> str:
+def _run_ncu_for(target: str, ncu_path: str) -> str:
     """Returns raw stdout (CSV) from ncu, or '' on failure (with a message
     printed explaining what to check).
     """
     cmd = [
-        "sudo", "ncu", "--set", "roofline", "--csv",
+        "sudo", ncu_path, "--set", "roofline", "--csv",
         sys.executable, __file__, "--target", target,
     ]
     print(f"\n$ {' '.join(cmd)}")
@@ -157,7 +166,8 @@ def main():
         return
 
     print(f"=== Phase 3 profiling driver — shape {SHAPE}, dtype {DTYPE_NAME} ===\n")
-    if not _check_prereqs():
+    tools = _find_tools()
+    if "ncu" not in tools or "nsys" not in tools:
         print("\nFix the above before continuing — see RUNBOOK.md section 6 (Nsight tools).")
         sys.exit(1)
 
@@ -166,7 +176,7 @@ def main():
 
     csv_outputs = {}
     for target in ("naive", "triton"):
-        csv_text = _run_ncu_for(target)
+        csv_text = _run_ncu_for(target, tools["ncu"])
         csv_outputs[target] = csv_text
         if csv_text:
             with open(f"results/traces/{target}_ncu.csv", "w") as f:
@@ -177,11 +187,11 @@ def main():
         _parse_and_summarize(csv_text, target)
 
     print("\n=== For manual/qualitative review (warp-stall reasons, full detail) ===")
-    print(f"sudo ncu --set full -o results/traces/naive_full {sys.executable} {__file__} --target naive")
-    print(f"sudo ncu --set full -o results/traces/triton_full {sys.executable} {__file__} --target triton")
-    print("Then: ncu -i results/traces/triton_full.ncu-rep   (opens the text report)")
+    print(f"sudo {tools['ncu']} --set full -o results/traces/naive_full {sys.executable} {__file__} --target naive")
+    print(f"sudo {tools['ncu']} --set full -o results/traces/triton_full {sys.executable} {__file__} --target triton")
+    print(f"Then: {tools['ncu']} -i results/traces/triton_full.ncu-rep   (opens the text report)")
     print("\n=== Timeline (Nsight Systems) ===")
-    print(f"sudo nsys profile -o results/traces/timeline {sys.executable} {__file__} --target triton")
+    print(f"sudo {tools['nsys']} profile -o results/traces/timeline {sys.executable} {__file__} --target triton")
 
     print("\nNext: once real column names are confirmed above, tell me what you see —")
     print("the roofline plot (roofline.plot_roofline) needs actual bytes-moved and")
