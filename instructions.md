@@ -211,7 +211,67 @@ as an unresolved mystery.
 
 ### Phase 3 — Profile
 
-- [ ] Not started.
+**In progress, not complete.** Goal: Nsight Compute (`ncu`) on naive vs
+Triton, pulling real HBM bytes moved + throughput, to finally answer Phase
+2's open question (why is Triton's TFLOP/s flat across the seq_len sweep
+instead of improving like SDPA's does?) and produce the roofline plot.
+
+- [x] **`roofline.py` implemented**: T4 peak specs from the published
+      datasheet (65 TFLOPS fp16 tensor-core, 8.1 TFLOPS fp32, 300 GB/s HBM
+      bandwidth), keyed by compute capability so it extends to other GPUs
+      rather than being hardcoded to only this card. bf16 deliberately
+      omitted — Turing (sm75) has no native bf16 tensor-core path, and its
+      real achieved ceiling here is unmeasured, not something to guess at.
+- [x] **No `ERR_NVGPUCTRPERM` permission error** — confirmed by just trying
+      it. This GCP box (real root, PCIe-passthrough GPU, not a shared/hosted
+      notebook) profiles fine; the permission wall the brief warned about
+      (Section 4.4) is specifically a Colab/Kaggle problem, doesn't apply
+      here. One less thing to worry about for the rest of this phase.
+- [x] **Found and fixed: `sudo` PATH gotcha.** `ncu`/`nsys` live at
+      `/usr/local/cuda/bin/`, on the invoking user's PATH but not on sudo's
+      restricted `secure_path` — `sudo ncu ...` failed with "command not
+      found" even though plain `ncu` resolved fine. Fixed by resolving
+      absolute paths via `shutil.which()` once and using those everywhere
+      instead of relying on sudo's own PATH resolution (commit `aca2434`).
+- [x] **Found and fixed: ncu's CSV is long-format, not wide.** Wrongly
+      assumed one row per kernel launch with each metric as a column. It's
+      actually one row per **(kernel launch, single metric)** — "Metric
+      Name"/"Metric Value" are themselves columns. This is what produced
+      the nonsensical first real output ("606/2361 launches, 1 column
+      each" — actually counting `==PROF==` status-line noise, a separate,
+      also-fixed issue). `_parse_launches()` now groups by launch ID and
+      pivots each launch's metrics into a proper dict (commit `845023c`).
+- [x] **Confirmed real kernel breakdown** at seq_len=2048, batch=2, heads=8,
+      head_dim=64, fp16: naive decomposes into two GEMM kernels
+      (`turing_fp16_s1688gemm_fp16_128x128...` and `...256x128...` — cuBLAS
+      picks a different algorithm for QKᵀ vs P@V, different tile shapes),
+      one softmax kernel, one scaling multiply, and copy/cast kernels
+      (matches `reference.py`'s fp32-softmax-then-cast-back). Triton's
+      `_fwd_kernel` confirmed captured. A `distribution_elementwise...`
+      kernel (torch.randn() generating test Q/K/V, not part of attention)
+      and a `FillFunctor` kernel (likely the autotuner's internal
+      cache-flush buffer between candidate-config timing trials) identified
+      as noise and excluded from `_parse_launches()`'s output.
+- [ ] **Not yet done — the actual next step**: the parser fix
+      (`_parse_launches`, commit `845023c`) has been pushed but **never
+      run** — its output (the list of available Metric Names per launch,
+      needed to confirm the real name for HBM bytes/throughput on this ncu
+      version) hasn't been seen yet. After that: pick the right launch(es)
+      per kernel (Triton's autotuning means several launches share the name
+      `_fwd_kernel` but have different grid/block sizes from different
+      configs — need the one matching the actual winning config, likely the
+      last one), extract `dram__bytes.sum`-equivalent + achieved throughput,
+      compute arithmetic intensity via `roofline.arithmetic_intensity()`,
+      and call `roofline.plot_roofline()` — none of this is wired up yet.
+- [ ] Warp-stall reasons (the qualitative "why" for occupancy/stalls) —
+      commands for `--set full` are printed by the script but never run;
+      that's a `ncu -i results/traces/triton_full.ncu-rep` text-report read,
+      not something to automate/parse.
+
+**To resume:** `git pull`, re-lock clocks (`sudo nvidia-smi -pm 1 && sudo
+nvidia-smi -lgc 1590` — doesn't survive stop/start), `sudo -v` (cache sudo
+credentials so the script's internal `sudo ncu` call doesn't hang on a
+password prompt), then `python3 scripts/03_profile.py`.
 
 ### Phase 4 — Extension
 

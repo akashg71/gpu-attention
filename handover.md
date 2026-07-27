@@ -1,4 +1,4 @@
-# Handover Brief — gpu-attention project, state after Phase 2
+# Handover Brief — gpu-attention project, state mid-Phase 3
 
 **For a fresh AI agent (or the human) picking this up without prior context.**
 Repo: `github.com/akashg71/gpu-attention` (public). This doc is a snapshot —
@@ -124,21 +124,69 @@ section. Concept reference notes (kernel theory + cloud/GPU-infra mechanics
 learned while deploying): `concepts.md`. Operational "what do I type":
 `RUNBOOK.md`.
 
-## What's next: Phase 3 — Profile
+## Phase 3 — Profile (in progress)
 
-Not started. This is meant to be the differentiator of the whole project:
-Nsight Compute (`ncu`) on the naive vs Triton kernels, pulling HBM bytes
-moved, memory throughput, occupancy, warp-stall reasons — then a roofline
-plot placing each kernel by arithmetic intensity. This is also where the
-Phase 2 open question (why is Triton's TFLOP/s flat instead of improving
-with scale?) should actually get answered, instead of guessed at.
+The differentiator phase: Nsight Compute (`ncu`) on naive vs Triton, pulling
+real HBM bytes moved + throughput, to finally answer Phase 2's open question
+(why is Triton's TFLOP/s flat across the seq_len sweep instead of improving
+like SDPA's does?) and produce the roofline plot. Not guessed at yet —
+that's the whole point of this phase.
 
-Prerequisites: `ncu`/`nsys` need to be present or installed
-(`sudo apt install -y nsight-compute nsight-systems`) — this needs real GPU
-performance-counter access, which requires root on the box (have it here,
-this being a self-managed VM, not a hosted notebook) but may still need the
-driver's `NVreg_RestrictProfilingToAdminUsers` flag checked/cleared if `ncu`
-throws a permissions error (`ERR_NVGPUCTRPERM`) — not yet tested on this box.
+**What's built:**
+- `roofline.py` — T4 peak specs from the published datasheet (65 TFLOPS
+  fp16 tensor-core, 8.1 TFLOPS fp32, 300 GB/s HBM bandwidth), keyed by
+  compute capability so it's not hardcoded to only this card.
+  `arithmetic_intensity()` and `plot_roofline()` implemented, not yet
+  called with real data (see below).
+- `scripts/03_profile.py` — `--target {naive,sdpa,triton}` mode (runs one
+  implementation in isolation, for `ncu` to wrap); driver mode shells out
+  to `ncu --set roofline --csv`, parses the result, prints a summary.
+
+**What's been learned/fixed getting this far (three real bugs, not
+guesses — each confirmed by actually running it on this box):**
+1. No `ERR_NVGPUCTRPERM` permission error. This GCP box (real root,
+   PCIe-passthrough GPU, not a shared/hosted notebook) profiles fine — the
+   permission wall the original brief warned about is specifically a
+   Colab/Kaggle problem and doesn't apply here.
+2. `sudo` PATH gotcha: `ncu`/`nsys` live at `/usr/local/cuda/bin/`, on the
+   user's PATH but not on `sudo`'s restricted `secure_path`, so
+   `sudo ncu ...` failed with "command not found" even though plain `ncu`
+   worked. Fixed by resolving absolute paths once via `shutil.which()` and
+   using those everywhere instead of relying on sudo to find them.
+3. `ncu`'s `--csv` output is **long-format**: one row per (kernel launch,
+   single metric) — "Metric Name"/"Metric Value" are themselves columns —
+   not one row per launch with metrics as columns as originally assumed.
+   `_parse_launches()` now groups rows by launch ID and pivots into a
+   proper per-launch metrics dict. Also confirmed and excluded two noise
+   kernels that aren't part of attention itself: `torch.randn()`'s RNG
+   kernel (generating test Q/K/V) and a `FillFunctor` kernel (likely the
+   Triton autotuner's internal cache-flush buffer between config trials).
+
+**Confirmed real kernel breakdown** (seq_len=2048, batch=2, heads=8,
+head_dim=64, fp16): naive decomposes into two GEMM kernels (different
+cuBLAS algorithm/tile-shape choices for QKᵀ vs P@V), one softmax kernel,
+one scaling multiply, and copy/cast kernels. Triton's `_fwd_kernel`
+confirmed captured.
+
+**Not done yet — the actual next step:** the long-format parser fix has
+been pushed but its output has never been seen. Next: run it, read off the
+real available Metric Names (confirms what this ncu version actually calls
+the HBM-bytes/throughput metrics — don't assume the brief's guessed names
+`dram__bytes.sum`/`gpu__dram_throughput` are exactly right), pick the
+correct launch(es) per kernel (Triton's autotuning means multiple launches
+share the name `_fwd_kernel` but differ in grid/block size — need the one
+matching the actual winning config, likely the last one), extract the
+metrics, compute arithmetic intensity, and actually call
+`roofline.plot_roofline()` — none of that is wired up yet.
+
+**Resume with:** `git pull`, re-lock clocks (`sudo nvidia-smi -pm 1 &&
+sudo nvidia-smi -lgc 1590` — doesn't survive stop/start), `sudo -v` (cache
+credentials so the script's internal `sudo ncu` call doesn't hang on a
+password prompt), then `python3 scripts/03_profile.py`.
+
+Prerequisites (already confirmed present on this box): `ncu`/`nsys` at
+`/usr/local/cuda/bin/`. If missing on a different box:
+`sudo apt install -y nsight-compute nsight-systems`.
 
 ## Notes for whichever agent picks this up
 
@@ -150,4 +198,10 @@ throws a permissions error (`ERR_NVGPUCTRPERM`) — not yet tested on this box.
   vocabulary (see `concepts.md` for what's already been explained).
 - Phases 0-2 have no open threads as of this writing — both loose ends noted
   in earlier drafts of this doc (the Phase 1 extended-grid re-run, and the
-  SDPA anomaly) were resolved and are recorded above. Phase 3 is next.
+  SDPA anomaly) were resolved and are recorded above.
+- Phase 3 is actively in progress, not "next" — three real bugs found and
+  fixed getting the profiling harness working at all (see above), but the
+  actual payoff (real bytes-moved numbers, the roofline plot) hasn't
+  happened yet. Don't report Phase 3 as unstarted or as done — it's
+  mid-flight. The concrete next action is spelled out above; do that
+  before anything else in this phase.
