@@ -124,20 +124,41 @@ def _run_ncu_for(target: str, ncu_path: str) -> str:
     return result.stdout
 
 
+def _strip_ncu_noise(raw_text: str) -> str:
+    """ncu's --csv stdout isn't pure CSV — it's interleaved with "==PROF=="
+    connection/profiling-progress status lines printed as profiling happens
+    (one or more per kernel launch). Strip those and blank lines so only the
+    actual CSV table (header + data rows) remains.
+    """
+    lines = [line for line in raw_text.splitlines()
+             if line.strip() and not line.startswith("==PROF==")]
+    return "\n".join(lines)
+
+
 def _parse_and_summarize(csv_text: str, label: str) -> None:
+    csv_text = _strip_ncu_noise(csv_text)
     if not csv_text.strip():
-        print(f"{label}: no output captured.")
+        print(f"{label}: no output captured (or it was entirely ==PROF== noise).")
         return
 
     reader = csv.DictReader(io.StringIO(csv_text))
     rows = list(reader)
     if not rows:
-        print(f"{label}: CSV had no data rows — raw output may be a warning/log, not a report.")
+        print(f"{label}: CSV had no data rows after stripping ==PROF== lines.")
         print(csv_text[:500])
         return
 
     print(f"\n{label}: {len(rows)} kernel launch(es) captured, {len(rows[0])} columns each.")
     print(f"Columns: {list(rows[0].keys())}")
+
+    name_col = next((c for c in rows[0].keys() if "kernel name" in c.lower()), None)
+    if name_col:
+        from collections import Counter
+        counts = Counter(r[name_col] for r in rows)
+        print(f"\nDistinct kernels captured (this run had no --launch-skip filtering,")
+        print(f"so warmup calls are in here too, not just the one 'real' call):")
+        for kname, count in counts.most_common():
+            print(f"  {count:>4}x  {kname}")
 
     byte_cols = [c for c in rows[0].keys() if "byte" in c.lower()]
     if byte_cols:
@@ -180,8 +201,8 @@ def main():
         csv_outputs[target] = csv_text
         if csv_text:
             with open(f"results/traces/{target}_ncu.csv", "w") as f:
-                f.write(csv_text)
-            print(f"Wrote results/traces/{target}_ncu.csv")
+                f.write(_strip_ncu_noise(csv_text))
+            print(f"Wrote results/traces/{target}_ncu.csv (==PROF== noise stripped)")
 
     for target, csv_text in csv_outputs.items():
         _parse_and_summarize(csv_text, target)
