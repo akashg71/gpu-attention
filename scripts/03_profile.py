@@ -163,19 +163,20 @@ def _parse_launches(csv_text: str, label: str) -> list[dict]:
 
     launches = {}
     for r in rows:
-        lid = r.get("ID")
+        lid = int(r.get("ID", -1))
         if lid not in launches:
             launches[lid] = {
+                "id": lid,
                 "kernel_name": r.get("Kernel Name", ""),
                 "grid_size": r.get("Grid Size", ""),
                 "block_size": r.get("Block Size", ""),
-                "metrics": {},
+                "metrics": {},  # name -> (value, unit)
             }
         metric_name = r.get("Metric Name", "")
         if metric_name:
-            launches[lid]["metrics"][metric_name] = r.get("Metric Value", "")
+            launches[lid]["metrics"][metric_name] = (r.get("Metric Value", ""), r.get("Metric Unit", ""))
 
-    all_launches = list(launches.values())
+    all_launches = sorted(launches.values(), key=lambda l: l["id"])
     real_launches = [l for l in all_launches
                       if not any(m in l["kernel_name"] for m in _NOISE_MARKERS)]
 
@@ -188,11 +189,20 @@ def _parse_launches(csv_text: str, label: str) -> list[dict]:
     for (name, grid, block), count in counts.most_common():
         print(f"  {count:>4}x  grid={grid:<15} block={block:<12} {name}")
 
-    if real_launches:
-        available_metrics = sorted(real_launches[0]["metrics"].keys())
-        print(f"\nMetric names available per launch ({len(available_metrics)} total):")
-        for m in available_metrics:
-            print(f"  {m}")
+    # Per-launch detail, in launch order (ID ascending) — this is what lets us
+    # SEE the transition from Triton's autotuning search (many different grid
+    # shapes early on) to steady state (the same grid repeating at the end),
+    # instead of guessing which launches are "the real one" from counts alone.
+    key_metrics = ["Duration", "DRAM Throughput", "Compute (SM) Throughput", "Memory Throughput"]
+    print(f"\nPer-launch detail, in launch order ({key_metrics}):")
+    for l in real_launches:
+        short_name = l["kernel_name"][:28]
+        vals = []
+        for m in key_metrics:
+            if m in l["metrics"]:
+                value, unit = l["metrics"][m]
+                vals.append(f"{m}={value}{unit}")
+        print(f"  id={l['id']:>4}  grid={l['grid_size']:<15} {short_name:<28}  {'  '.join(vals)}")
 
     return real_launches
 
