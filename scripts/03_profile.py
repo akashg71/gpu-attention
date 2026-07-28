@@ -48,7 +48,7 @@ def run_target(name: str) -> None:
 
     from gpu_attention.env import get_device
     from gpu_attention.reference import attention_naive, attention_sdpa
-    from gpu_attention.triton_attention import triton_attention
+    from gpu_attention.triton_attention import triton_attention, _fwd_kernel
 
     device = get_device()
     q = torch.randn(SHAPE["batch"], SHAPE["heads"], SHAPE["seq_len"], SHAPE["head_dim"],
@@ -71,6 +71,20 @@ def run_target(name: str) -> None:
 
     fn()  # the call actually meant to be profiled
     torch.cuda.synchronize()
+
+    if name == "triton":
+        # To stderr, not stdout — ncu's CSV report is on stdout, and mixing
+        # print() output into that stream would corrupt parsing again (same
+        # class of bug as the ==PROF== noise). Asks the autotuner directly
+        # which config it picked, rather than inferring it from ncu's replay
+        # order — several _CONFIGS entries share identical grid/block
+        # dimensions (same BLOCK_M and num_warps, differing only in BLOCK_N/
+        # num_stages, neither visible in ncu's report), so grid/block alone
+        # can't always disambiguate which config actually won.
+        print(f"[diagnostic] autotuner cache: {getattr(_fwd_kernel, 'cache', 'NO .cache ATTR')}",
+              file=sys.stderr)
+        print(f"[diagnostic] autotuner best_config: {getattr(_fwd_kernel, 'best_config', 'NO .best_config ATTR')}",
+              file=sys.stderr)
 
 
 def _find_tools() -> dict:
@@ -120,6 +134,10 @@ def _run_ncu_for(target: str, ncu_path: str) -> str:
             print("Run: ncu --list-sets    and    ncu --query-metrics | head -50")
             print("to see what's actually available, then adjust this script.")
         return ""
+
+    diagnostic_lines = [l for l in result.stderr.splitlines() if l.startswith("[diagnostic]")]
+    for line in diagnostic_lines:
+        print(line)
 
     return result.stdout
 
@@ -207,6 +225,69 @@ def _parse_launches(csv_text: str, label: str) -> list[dict]:
     return real_launches
 
 
+_TIME_UNIT_TO_SECONDS = {"ns": 1e-9, "us": 1e-6, "ms": 1e-3, "s": 1.0}
+
+
+def _representative_naive_launches(launches: list[dict]) -> list[dict]:
+    """One representative per distinct kernel name. Naive's kernels showed
+    near-identical metrics across all 4 occurrences in the real run (no
+    autotuning, no warmup-dependent variance) — any occurrence works;
+    taking the last (chronologically) avoids relying on that assumption.
+    """
+    by_name = {}
+    for l in launches:
+        by_name[l["kernel_name"]] = l
+    return list(by_name.values())
+
+
+def _representative_triton_launches(launches: list[dict], tolerance: float = 0.05) -> list[dict]:
+    """The tail cluster of launches sharing the same grid/block with Duration
+    within `tolerance` of the very last launch. Triton's autotune search
+    (many launches, early in ID order, several different grid/block shapes)
+    should end and settle into a repeated steady-state shape by the end of
+    the launch sequence — this walks backward from the last launch and stops
+    at the first one that doesn't match, rather than assuming a specific
+    launch count (which depends on exactly how many configs/trials the
+    search needed, not something to hardcode).
+    """
+    if not launches:
+        return []
+    last = launches[-1]
+    last_val = float(last["metrics"]["Duration"][0])
+
+    cluster = []
+    for l in reversed(launches):
+        if l["kernel_name"] != last["kernel_name"] or l["grid_size"] != last["grid_size"]:
+            break
+        val = float(l["metrics"]["Duration"][0])
+        if abs(val - last_val) / last_val > tolerance:
+            break
+        cluster.append(l)
+    return list(reversed(cluster))
+
+
+def _bytes_moved(launches: list[dict], peak_bandwidth_gbps: float) -> float:
+    """bytes ≈ (DRAM Throughput % of peak) × peak_bandwidth × Duration,
+    summed across launches. Deliberately uses ncu's throughput PERCENTAGE,
+    not its absolute Duration, combined with that same Duration — the
+    percentage is normalized to whatever the (possibly profiling-inflated)
+    duration actually was, so profiling overhead cancels out of the bytes
+    estimate even though it would corrupt a direct latency comparison.
+    """
+    total = 0.0
+    for l in launches:
+        if "Duration" not in l["metrics"] or "DRAM Throughput" not in l["metrics"]:
+            continue
+        dur_val, dur_unit = l["metrics"]["Duration"]
+        dram_val, dram_unit = l["metrics"]["DRAM Throughput"]
+        if dram_unit != "%":
+            continue  # unexpected unit — skip rather than silently miscompute
+        duration_s = float(dur_val) * _TIME_UNIT_TO_SECONDS.get(dur_unit, 1e-9)
+        dram_fraction = float(dram_val) / 100.0
+        total += dram_fraction * peak_bandwidth_gbps * 1e9 * duration_s
+    return total
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--target", choices=["naive", "sdpa", "triton"], default=None)
@@ -234,8 +315,64 @@ def main():
                 f.write(_strip_ncu_noise(csv_text))
             print(f"Wrote results/traces/{target}_ncu.csv (==PROF== noise stripped)")
 
+    parsed = {}
     for target, csv_text in csv_outputs.items():
-        _parse_launches(csv_text, target)
+        parsed[target] = _parse_launches(csv_text, target)
+
+    print("\n=== Computing bytes moved, arithmetic intensity, roofline ===")
+    import torch
+    from gpu_attention import roofline
+    from gpu_attention.env import get_device
+    from gpu_attention.reference import attention_naive
+    from gpu_attention.triton_attention import triton_attention
+    from gpu_attention.benchmark import bench_one, attention_flops
+
+    device = get_device()
+    peak_bw = roofline.get_peak_hbm_bandwidth_gbps(device)
+
+    naive_reps = _representative_naive_launches(parsed.get("naive", []))
+    triton_reps = _representative_triton_launches(parsed.get("triton", []))
+    print(f"naive: {len(naive_reps)} representative kernels (1 per distinct kernel in the pipeline)")
+    print(f"triton: {len(triton_reps)} representative launches (tail steady-state cluster)")
+
+    naive_bytes = _bytes_moved(naive_reps, peak_bw)
+    triton_bytes = _bytes_moved(triton_reps, peak_bw)
+    print(f"naive total HBM traffic:  {naive_bytes / 1e9:.3f} GB")
+    print(f"triton total HBM traffic: {triton_bytes / 1e9:.3f} GB")
+
+    # Fresh, UNPROFILED latency at the same shape for achieved FLOP/s — not
+    # ncu's Duration, which we already saw is inflated ~3-4x for Triton by
+    # profiling instrumentation overhead. This mirrors exactly how Phase 2
+    # measured latency (bench_one, CUDA events, no profiler attached).
+    q = torch.randn(SHAPE["batch"], SHAPE["heads"], SHAPE["seq_len"], SHAPE["head_dim"],
+                     device=device, dtype=torch.float16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+
+    naive_bench = bench_one("naive", lambda: attention_naive(q, k, v, causal=False),
+                             causal=False, device=device, **SHAPE)
+    triton_bench = bench_one("triton", lambda: triton_attention(q, k, v, causal=False),
+                              causal=False, device=device, **SHAPE)
+    print(f"naive latency (fresh, unprofiled):  {naive_bench.latency_ms:.3f}ms")
+    print(f"triton latency (fresh, unprofiled): {triton_bench.latency_ms:.3f}ms")
+
+    flops = attention_flops(SHAPE["batch"], SHAPE["heads"], SHAPE["seq_len"], SHAPE["head_dim"], causal=False)
+    naive_achieved_flops = flops / (naive_bench.latency_ms / 1000)
+    triton_achieved_flops = flops / (triton_bench.latency_ms / 1000)
+
+    naive_ai = roofline.arithmetic_intensity(flops, naive_bytes)
+    triton_ai = roofline.arithmetic_intensity(flops, triton_bytes)
+    print(f"naive arithmetic intensity:  {naive_ai:.3f} FLOPs/byte, {naive_achieved_flops / 1e12:.3f} TFLOP/s achieved")
+    print(f"triton arithmetic intensity: {triton_ai:.3f} FLOPs/byte, {triton_achieved_flops / 1e12:.3f} TFLOP/s achieved")
+
+    import os
+    os.makedirs("results/figures", exist_ok=True)
+    roofline.plot_roofline(
+        device, torch.float16,
+        [("naive", naive_ai, naive_achieved_flops), ("triton", triton_ai, triton_achieved_flops)],
+        "results/figures/roofline.png",
+    )
+    print("\nWrote results/figures/roofline.png")
 
     print("\n=== For manual/qualitative review (warp-stall reasons, full detail) ===")
     print(f"sudo {tools['ncu']} --set full -o results/traces/naive_full {sys.executable} {__file__} --target naive")
@@ -243,10 +380,6 @@ def main():
     print(f"Then: {tools['ncu']} -i results/traces/triton_full.ncu-rep   (opens the text report)")
     print("\n=== Timeline (Nsight Systems) ===")
     print(f"sudo {tools['nsys']} profile -o results/traces/timeline {sys.executable} {__file__} --target triton")
-
-    print("\nNext: once real column names are confirmed above, tell me what you see —")
-    print("the roofline plot (roofline.plot_roofline) needs actual bytes-moved and")
-    print("achieved-FLOP/s numbers from this output, not guessed column names.")
 
 
 if __name__ == "__main__":
