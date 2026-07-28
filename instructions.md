@@ -211,10 +211,13 @@ as an unresolved mystery.
 
 ### Phase 3 — Profile
 
-**In progress, not complete.** Goal: Nsight Compute (`ncu`) on naive vs
-Triton, pulling real HBM bytes moved + throughput, to finally answer Phase
-2's open question (why is Triton's TFLOP/s flat across the seq_len sweep
-instead of improving like SDPA's does?) and produce the roofline plot.
+**DONE.** Goal: Nsight Compute (`ncu`) on naive vs Triton, pulling real HBM
+bytes moved + throughput, to finally answer Phase 2's open question (why is
+Triton's TFLOP/s flat across the seq_len sweep instead of improving like
+SDPA's does?) and produce the roofline plot. Answered — see the finding at
+the end of this section, arrived at only after fixing several real bugs in
+the profiling harness itself along the way (documented below in the order
+they were actually hit, not cleaned up in hindsight).
 
 - [x] **`roofline.py` implemented**: T4 peak specs from the published
       datasheet (65 TFLOPS fp16 tensor-core, 8.1 TFLOPS fp32, 300 GB/s HBM
@@ -263,15 +266,61 @@ instead of improving like SDPA's does?) and produce the roofline plot.
       last one), extract `dram__bytes.sum`-equivalent + achieved throughput,
       compute arithmetic intensity via `roofline.arithmetic_intensity()`,
       and call `roofline.plot_roofline()` — none of this is wired up yet.
-- [ ] Warp-stall reasons (the qualitative "why" for occupancy/stalls) —
-      commands for `--set full` are printed by the script but never run;
-      that's a `ncu -i results/traces/triton_full.ncu-rep` text-report read,
-      not something to automate/parse.
+- [x] **Bytes-moved aggregation bug, caught before trusting the result.**
+      First real computation showed Triton moving ~4.05GB vs naive's
+      ~2.11GB — the opposite of the entire point of the kernel. Root cause
+      was in the analysis code, not the kernel: naive's 6 representative
+      launches are DIFFERENT sequential kernels forming one pipeline, so
+      summing them is correct ("bytes for one call"). Triton's steady-state
+      cluster is the SAME kernel launched 4 independent times — summing
+      counted one call's bytes four times over. Fixed to average Triton's
+      cluster instead of summing it (naive still sums, correctly).
+- [x] **Corrected result: Triton moves ~1.01GB vs naive's ~2.10GB** — almost
+      exactly half, confirming the O(N) vs O(N²) memory thesis with real
+      measured data. Arithmetic intensity: naive 8.19 FLOPs/byte, Triton
+      16.96 FLOPs/byte (~2x, consistent with ~half the bytes at the same
+      FLOP count). Both sit far below the T4's roofline ridge point (~217
+      FLOPs/byte for fp16) — confirms attention is memory-bound on this
+      hardware regardless of implementation. See
+      `results/figures/roofline.png`.
+- [x] **Warp-stall reasons + achieved occupancy — the actual "why".** Ran
+      `--set full` (a much heavier collection — 105 kernel launches × 31
+      replay passes each) and read the text report. Found:
+  - **Theoretical Occupancy capped at 25%** for the steady-state `_fwd_kernel`
+    launches — not a failure to reach potential, the kernel is *at* its
+    ceiling (achieved 24.7%, right at the theoretical cap). Most likely
+    cause: register pressure from holding the online-softmax accumulators
+    (running max/sum/output) largely in registers, limiting how many
+    concurrent thread-blocks fit per SM.
+  - This is the direct cause of the "low DRAM% and low Compute% at the same
+    time" pattern found earlier — not two separate problems, one problem
+    (insufficient occupancy) with two symptoms: not enough concurrent warps
+    to hide memory latency *or* keep compute pipelines fed.
+  - Dominant stall reason: ~53% of stall cycles are warps waiting on the MIO
+    queue (shared-memory/special-instruction pipeline) being full. Nsight's
+    own analysis estimates up to a **50.95% speedup** if this specific
+    stall were eliminated — a quantified number, not a guess.
+  - **Full causal chain**: small tile config → high per-thread register
+    usage → few concurrent thread-blocks per SM → 25% occupancy ceiling →
+    insufficient parallelism to hide memory or compute latency → both
+    utilization numbers stay low → despite moving half the bytes naive
+    does, wall-clock time still loses.
+  - Caveat: this specific `--set full` run's autotuner picked a *different*
+    near-tied config (`BLOCK_N=32, num_stages=2`) than the two lighter
+    `--set roofline` runs did (`BLOCK_N=64, num_stages=3`) — both share
+    `BLOCK_M=32`/`num_warps=4` so are indistinguishable by grid/block size
+    alone. Likely explanation: heavier profiling overhead perturbed the
+    autotuner's own timing-based decision between two very close
+    candidates. The occupancy/stall story should still be representative
+    of the small-tile config family, but isn't a perfect match to the
+    exact config behind the roofline numbers above.
+  - **This is explanation, not a fix** — deliberately not attempting to
+    reduce the register pressure now (real kernel restructuring, not a
+    quick tweak) — out of scope for a profiling phase. Noted as candidate
+    future work, not pursued.
 
-**To resume:** `git pull`, re-lock clocks (`sudo nvidia-smi -pm 1 && sudo
-nvidia-smi -lgc 1590` — doesn't survive stop/start), `sudo -v` (cache sudo
-credentials so the script's internal `sudo ncu` call doesn't hang on a
-password prompt), then `python3 scripts/03_profile.py`.
+Raw logs from each run: `results/logs/phase3_profile_run1.md`,
+`phase3_profile_run2.md`, `phase_3_profile_full_run1.md`.
 
 ### Phase 4 — Extension
 

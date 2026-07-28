@@ -124,69 +124,75 @@ section. Concept reference notes (kernel theory + cloud/GPU-infra mechanics
 learned while deploying): `concepts.md`. Operational "what do I type":
 `RUNBOOK.md`.
 
-## Phase 3 — Profile (in progress)
+## Phase 3 — Profile (DONE)
 
-The differentiator phase: Nsight Compute (`ncu`) on naive vs Triton, pulling
-real HBM bytes moved + throughput, to finally answer Phase 2's open question
-(why is Triton's TFLOP/s flat across the seq_len sweep instead of improving
-like SDPA's does?) and produce the roofline plot. Not guessed at yet —
-that's the whole point of this phase.
+The differentiator phase, and it delivered: Nsight Compute (`ncu`) on naive
+vs Triton, real HBM bytes moved, the roofline plot, and — the actual payoff —
+a hardware-grounded answer to Phase 2's open question (why was Triton's
+TFLOP/s flat across the seq_len sweep instead of improving like SDPA's did?).
 
-**What's built:**
-- `roofline.py` — T4 peak specs from the published datasheet (65 TFLOPS
-  fp16 tensor-core, 8.1 TFLOPS fp32, 300 GB/s HBM bandwidth), keyed by
-  compute capability so it's not hardcoded to only this card.
-  `arithmetic_intensity()` and `plot_roofline()` implemented, not yet
-  called with real data (see below).
-- `scripts/03_profile.py` — `--target {naive,sdpa,triton}` mode (runs one
-  implementation in isolation, for `ncu` to wrap); driver mode shells out
-  to `ncu --set roofline --csv`, parses the result, prints a summary.
+**The finding, i.e. the point of the whole project:**
+- Triton moves **~1.01GB** of HBM traffic for one call at seq_len=2048;
+  naive moves **~2.10GB** — almost exactly half, confirming the O(N) vs
+  O(N²) memory thesis with real measured data, not just theory. Arithmetic
+  intensity: naive 8.19 FLOPs/byte, Triton 16.96 (~2x, consistent with half
+  the bytes at equal FLOPs). Both sit far below the T4's roofline ridge
+  point (~217 FLOPs/byte for fp16) — attention is memory-bound on this
+  hardware regardless of implementation. See `results/figures/roofline.png`.
+- **But Triton is still slower in wall-clock time** (12.49ms vs naive's
+  8.59ms) despite moving half the bytes. Nsight Compute's `--set full`
+  (occupancy + warp-stall data) explains why: **Theoretical Occupancy is
+  capped at 25%** for Triton's steady-state kernel launches — not a
+  failure to reach potential, the kernel sits right at that ceiling
+  (achieved 24.7%). Most likely cause: register pressure from holding the
+  online-softmax accumulators (running max/sum/output) largely in
+  registers, limiting how many concurrent thread-blocks fit per SM.
+- That occupancy ceiling is the single root cause of the earlier "low DRAM%
+  and low Compute% at the same time" pattern — not two problems, one
+  problem (not enough concurrent warps to hide memory latency *or* keep
+  compute pipelines fed) with two symptoms. Dominant stall reason: ~53% of
+  stall cycles are warps waiting on the MIO queue (shared-memory/special-
+  instruction pipeline) being full; Nsight's own analysis estimates up to a
+  **50.95% speedup** if that specific stall were eliminated.
+- **Full causal chain**: small tile config → high per-thread register usage
+  → few concurrent thread-blocks per SM → 25% occupancy ceiling →
+  insufficient parallelism to hide latency → low utilization on both memory
+  and compute → despite moving half the bytes naive does, still loses on
+  wall-clock time.
+- This is explanation, not a fix — reducing the register pressure is real
+  kernel restructuring (candidate future work), deliberately not attempted
+  here; out of scope for a profiling phase.
+- Caveat worth carrying forward: the `--set full` run's autotuner picked a
+  different near-tied config (`BLOCK_N=32, num_stages=2`) than the two
+  lighter `--set roofline` runs did (`BLOCK_N=64, num_stages=3`) — both
+  share `BLOCK_M=32`/`num_warps=4`, indistinguishable by grid/block size
+  alone. Likely: heavier profiling overhead perturbed the autotuner's own
+  timing-based decision between two close candidates. The occupancy story
+  should still be representative of the small-tile config family, but
+  isn't a perfect match to the exact config behind the roofline numbers.
 
-**What's been learned/fixed getting this far (three real bugs, not
-guesses — each confirmed by actually running it on this box):**
-1. No `ERR_NVGPUCTRPERM` permission error. This GCP box (real root,
-   PCIe-passthrough GPU, not a shared/hosted notebook) profiles fine — the
-   permission wall the original brief warned about is specifically a
-   Colab/Kaggle problem and doesn't apply here.
-2. `sudo` PATH gotcha: `ncu`/`nsys` live at `/usr/local/cuda/bin/`, on the
-   user's PATH but not on `sudo`'s restricted `secure_path`, so
-   `sudo ncu ...` failed with "command not found" even though plain `ncu`
-   worked. Fixed by resolving absolute paths once via `shutil.which()` and
-   using those everywhere instead of relying on sudo to find them.
-3. `ncu`'s `--csv` output is **long-format**: one row per (kernel launch,
-   single metric) — "Metric Name"/"Metric Value" are themselves columns —
-   not one row per launch with metrics as columns as originally assumed.
-   `_parse_launches()` now groups rows by launch ID and pivots into a
-   proper per-launch metrics dict. Also confirmed and excluded two noise
-   kernels that aren't part of attention itself: `torch.randn()`'s RNG
-   kernel (generating test Q/K/V) and a `FillFunctor` kernel (likely the
-   Triton autotuner's internal cache-flush buffer between config trials).
+**Bugs found and fixed getting here** (real ones, not guesses — each
+confirmed by actually running on this box): no `ERR_NVGPUCTRPERM`
+permission wall (this GCP box's real root + PCIe-passthrough GPU sidesteps
+the Colab/Kaggle restriction); a `sudo` PATH gotcha (`ncu`/`nsys` live at
+`/usr/local/cuda/bin/`, on the user's PATH but not `sudo`'s `secure_path` —
+fixed via `shutil.which()` + absolute paths); `ncu`'s CSV is long-format
+(one row per kernel-launch-×-single-metric, not one row per launch with
+metrics as columns); and a bytes-aggregation bug caught *before* trusting
+the result — the first real computation showed Triton moving 2x *more*
+bytes than naive (the opposite of the point of the kernel), traced to
+wrongly summing across repeated launches of the same kernel (correct for
+naive's 6 *different* sequential kernels, wrong for Triton's repeated
+launches of *one* kernel — fixed to average instead).
 
-**Confirmed real kernel breakdown** (seq_len=2048, batch=2, heads=8,
-head_dim=64, fp16): naive decomposes into two GEMM kernels (different
-cuBLAS algorithm/tile-shape choices for QKᵀ vs P@V), one softmax kernel,
-one scaling multiply, and copy/cast kernels. Triton's `_fwd_kernel`
-confirmed captured.
+Full narrative with all intermediate (broken) numbers, in the order they
+actually happened: `instructions.md`'s Progress Log, Phase 3 section. Raw
+terminal logs: `results/logs/phase3_profile_run1.md`, `phase3_profile_run2.md`,
+`phase_3_profile_full_run1.md`.
 
-**Not done yet — the actual next step:** the long-format parser fix has
-been pushed but its output has never been seen. Next: run it, read off the
-real available Metric Names (confirms what this ncu version actually calls
-the HBM-bytes/throughput metrics — don't assume the brief's guessed names
-`dram__bytes.sum`/`gpu__dram_throughput` are exactly right), pick the
-correct launch(es) per kernel (Triton's autotuning means multiple launches
-share the name `_fwd_kernel` but differ in grid/block size — need the one
-matching the actual winning config, likely the last one), extract the
-metrics, compute arithmetic intensity, and actually call
-`roofline.plot_roofline()` — none of that is wired up yet.
-
-**Resume with:** `git pull`, re-lock clocks (`sudo nvidia-smi -pm 1 &&
-sudo nvidia-smi -lgc 1590` — doesn't survive stop/start), `sudo -v` (cache
-credentials so the script's internal `sudo ncu` call doesn't hang on a
-password prompt), then `python3 scripts/03_profile.py`.
-
-Prerequisites (already confirmed present on this box): `ncu`/`nsys` at
-`/usr/local/cuda/bin/`. If missing on a different box:
-`sudo apt install -y nsight-compute nsight-systems`.
+Reference for next session: `ncu`/`nsys` at `/usr/local/cuda/bin/`. Re-lock
+clocks each session (`sudo nvidia-smi -pm 1 && sudo nvidia-smi -lgc 1590` —
+doesn't survive stop/start).
 
 ## Notes for whichever agent picks this up
 
