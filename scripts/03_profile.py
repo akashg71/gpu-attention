@@ -266,15 +266,23 @@ def _representative_triton_launches(launches: list[dict], tolerance: float = 0.0
     return list(reversed(cluster))
 
 
-def _bytes_moved(launches: list[dict], peak_bandwidth_gbps: float) -> float:
-    """bytes ≈ (DRAM Throughput % of peak) × peak_bandwidth × Duration,
-    summed across launches. Deliberately uses ncu's throughput PERCENTAGE,
-    not its absolute Duration, combined with that same Duration — the
-    percentage is normalized to whatever the (possibly profiling-inflated)
-    duration actually was, so profiling overhead cancels out of the bytes
-    estimate even though it would corrupt a direct latency comparison.
+def _bytes_per_launch(launches: list[dict], peak_bandwidth_gbps: float) -> list[float]:
+    """bytes ≈ (DRAM Throughput % of peak) × peak_bandwidth × Duration, one
+    value per launch. Deliberately uses ncu's throughput PERCENTAGE, not its
+    absolute Duration alone — the percentage is normalized to whatever the
+    (possibly profiling-inflated) duration actually was, so profiling
+    overhead cancels out of the bytes estimate even though it would corrupt
+    a direct latency comparison.
+
+    Returns a list rather than a total — summing is only correct across
+    launches that are DIFFERENT sequential kernels forming one pipeline
+    (naive's 6 kernels: GEMM, scale, cast, softmax, cast, GEMM = one call).
+    Summing across REPEATED launches of the SAME kernel (Triton's
+    steady-state cluster — several launches of _fwd_kernel, all doing
+    independent, complete calls) would count one call's bytes N times over.
+    Caller sums or averages depending on which situation applies.
     """
-    total = 0.0
+    values = []
     for l in launches:
         if "Duration" not in l["metrics"] or "DRAM Throughput" not in l["metrics"]:
             continue
@@ -284,8 +292,8 @@ def _bytes_moved(launches: list[dict], peak_bandwidth_gbps: float) -> float:
             continue  # unexpected unit — skip rather than silently miscompute
         duration_s = float(dur_val) * _TIME_UNIT_TO_SECONDS.get(dur_unit, 1e-9)
         dram_fraction = float(dram_val) / 100.0
-        total += dram_fraction * peak_bandwidth_gbps * 1e9 * duration_s
-    return total
+        values.append(dram_fraction * peak_bandwidth_gbps * 1e9 * duration_s)
+    return values
 
 
 def main():
@@ -335,10 +343,17 @@ def main():
     print(f"naive: {len(naive_reps)} representative kernels (1 per distinct kernel in the pipeline)")
     print(f"triton: {len(triton_reps)} representative launches (tail steady-state cluster)")
 
-    naive_bytes = _bytes_moved(naive_reps, peak_bw)
-    triton_bytes = _bytes_moved(triton_reps, peak_bw)
-    print(f"naive total HBM traffic:  {naive_bytes / 1e9:.3f} GB")
-    print(f"triton total HBM traffic: {triton_bytes / 1e9:.3f} GB")
+    # naive: SUM across its 6 representative launches -- different sequential
+    # kernels forming one pipeline, so the sum is "bytes for one full call".
+    naive_bytes = sum(_bytes_per_launch(naive_reps, peak_bw))
+    # triton: AVERAGE across the steady-state cluster -- repeated launches of
+    # the SAME single-kernel pipeline; summing would count one call's bytes
+    # once per cluster member instead of representing "bytes for one call".
+    triton_per_launch = _bytes_per_launch(triton_reps, peak_bw)
+    triton_bytes = sum(triton_per_launch) / len(triton_per_launch)
+    print(f"naive total HBM traffic (one call):  {naive_bytes / 1e9:.3f} GB")
+    print(f"triton total HBM traffic (one call): {triton_bytes / 1e9:.3f} GB "
+          f"(averaged over {len(triton_per_launch)} steady-state launches)")
 
     # Fresh, UNPROFILED latency at the same shape for achieved FLOP/s — not
     # ncu's Duration, which we already saw is inflated ~3-4x for Triton by
