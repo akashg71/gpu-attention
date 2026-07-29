@@ -46,6 +46,18 @@ _CONFIGS = [
     triton.Config({"BLOCK_M": 32, "BLOCK_N": 64}, num_warps=4, num_stages=3),
     triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}, num_warps=4, num_stages=2),
     triton.Config({"BLOCK_M": 128, "BLOCK_N": 32}, num_warps=4, num_stages=2),
+    # Phase 3 profiling (ncu --set full) on a T4 confirmed the winning
+    # BLOCK_M=32 configs above are capped at 25% theoretical occupancy by
+    # TWO tied constraints at once: 213 registers/thread AND 16.38KB shared
+    # memory/block each independently limit to 2 concurrent blocks/SM.
+    # Registers are the harder of the two (the math caps at 2 blocks from
+    # registers alone, regardless of shared memory), so maxnreg is a real
+    # lever here, not a no-op — these are an experiment to let autotuning
+    # empirically decide if capping registers (risking spill-to-local-memory
+    # traffic) nets out faster than today's winner, not an assumed fix.
+    triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}, num_warps=4, num_stages=2, maxnreg=128),
+    triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}, num_warps=4, num_stages=1, maxnreg=128),
+    triton.Config({"BLOCK_M": 32, "BLOCK_N": 64}, num_warps=4, num_stages=2, maxnreg=128),
 ]
 
 
