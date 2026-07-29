@@ -41,7 +41,7 @@ def load_model(device: torch.device, dtype: torch.dtype = torch.float16):
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=dtype).to(device)
+    model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, dtype=dtype).to(device)
     model.eval()
     return model, tokenizer
 
