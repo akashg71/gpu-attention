@@ -53,15 +53,21 @@ def load_model(device: torch.device, dtype: torch.dtype = torch.bfloat16):
     return model, tokenizer
 
 
-def make_prompt(tokenizer, device: torch.device, target_len: int) -> torch.Tensor:
+def make_prompt(tokenizer, device: torch.device, target_len: int, batch_size: int = 1) -> torch.Tensor:
     """Tokenizes SAMPLE_TEXT and repeats/truncates it to exactly target_len
     tokens, so the context-length sweep can hit specific lengths with real
-    (if repetitive) text rather than random garbage.
+    (if repetitive) text rather than random garbage. batch_size > 1
+    replicates the same sequence across the batch dim -- every observed
+    CUBLAS_STATUS_EXECUTION_FAILED so far has had n=1 (the flattened
+    batch*seq dim collapsing to 1 during single-sequence decode, a GEMM
+    shape Phases 0-3 never exercised); batching multiple sequences avoids
+    that degenerate size and is also more realistic (real serving batches
+    concurrent requests rather than decoding one sequence alone).
     """
     ids = tokenizer(SAMPLE_TEXT, return_tensors="pt").input_ids[0]
     reps = (target_len // ids.shape[0]) + 1
     ids = ids.repeat(reps)[:target_len]
-    return ids.unsqueeze(0).to(device)
+    return ids.unsqueeze(0).repeat(batch_size, 1).to(device)
 
 
 def quantize_int8(tensor: torch.Tensor) -> tuple:
@@ -220,16 +226,20 @@ def theoretical_min_step_ms(cache_bytes_total: int, peak_bandwidth_gbps: float) 
     return (cache_bytes_total / (peak_bandwidth_gbps * 1e9)) * 1000
 
 
-def run_context_sweep(device: torch.device, prompt_lengths=(32, 128, 512, 1024), num_new_tokens: int = 20):
+def run_context_sweep(device: torch.device, prompt_lengths=(32, 128, 512, 1024), num_new_tokens: int = 20,
+                       batch_size: int = 4):
     """For each starting prompt length: prefill, then decode num_new_tokens,
     reporting median per-token latency and peak memory. Rising per-token
     latency as prompt_lengths grows is the direct evidence decode is
     memory-bandwidth-bound (each step re-reads the whole cache).
+
+    batch_size defaults to 4, not 1 -- see make_prompt's docstring; batch=1
+    decode hit a real CUBLAS_STATUS_EXECUTION_FAILED on this box.
     """
     model, tokenizer = load_model(device)
     results = []
     for prompt_len in prompt_lengths:
-        input_ids = make_prompt(tokenizer, device, prompt_len)
+        input_ids = make_prompt(tokenizer, device, prompt_len, batch_size=batch_size)
 
         torch.cuda.reset_peak_memory_stats(device)
         _, per_token_ms, past = decode_baseline(model, input_ids, num_new_tokens)
@@ -250,9 +260,10 @@ def run_context_sweep(device: torch.device, prompt_lengths=(32, 128, 512, 1024),
     return results
 
 
-def compare_baseline_vs_int8(device: torch.device, prompt_len: int = 512, num_new_tokens: int = 20):
+def compare_baseline_vs_int8(device: torch.device, prompt_len: int = 512, num_new_tokens: int = 20,
+                              batch_size: int = 4):
     model, tokenizer = load_model(device)
-    input_ids = make_prompt(tokenizer, device, prompt_len)
+    input_ids = make_prompt(tokenizer, device, prompt_len, batch_size=batch_size)
 
     torch.cuda.reset_peak_memory_stats(device)
     gen_base, ms_base, past_base = decode_baseline(model, input_ids.clone(), num_new_tokens)
