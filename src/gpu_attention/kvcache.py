@@ -11,16 +11,23 @@ kernel here — the point is showing the memory-bound *decode* story
 generalizes past a single hand-written kernel, using a real model's real
 cache, not re-deriving Phases 0-3 inside a bigger model.
 
-*** UNVERIFIED against a real transformers install. *** Written without a
-GPU/transformers to check against — same situation the Triton kernel was
-in during Phase 0. The main risk: `past_key_values`'s exact type (a legacy
-tuple-of-tuples vs a newer `Cache` object) differs across transformers
-versions. Handled via `_cache_to_tuples`/`_tuples_to_cache`, which use
-`to_legacy_cache()`/`from_legacy_cache()` when available and fall back to
-raw tuples otherwise — but this is a best-effort guess at the installed
-version's API, not a confirmed match. Run scripts/04_extension.py and
-expect to fix this against whatever `transformers.__version__` actually is
-here, same "verify on real hardware" pattern as everything before it.
+Runs in bf16, not fp16, by default. Plain GPT-2 was trained in fp32 without
+the stability tricks newer models use to stay fp16-safe, and hit a real
+CUDA device-side assert in fp16 on this box (preceded by a
+CUBLAS_STATUS_EXECUTION_FAILED warning) — consistent with activation
+overflow, since fp16's max representable value (~65504) is easy to exceed.
+bf16 has fp32's exponent range at the same 2-bytes-per-element size, so no
+overflow risk, at the cost of less mantissa precision. Phase 1 already
+established this T4 lacks native bf16 tensor-core support (Turing, not
+Ampere+) — bf16 still runs correctly here, just without hardware
+acceleration, which is the right trade when the goal is getting a correct
+decode loop working, not maximum throughput.
+
+Verified against transformers 5.14.1 specifically: `to_legacy_cache()` and
+`from_legacy_cache()` were both removed (not just deprecated) — iterating
+a `DynamicCache` directly yields (key, value, None) per layer, and
+reconstruction goes through `DynamicCache().update(k, v, layer_idx)`
+instead. See `_cache_to_tuples`/`_tuples_to_cache`.
 """
 import torch
 
@@ -37,7 +44,7 @@ SAMPLE_TEXT = (
 )
 
 
-def load_model(device: torch.device, dtype: torch.dtype = torch.float16):
+def load_model(device: torch.device, dtype: torch.dtype = torch.bfloat16):
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
@@ -107,8 +114,9 @@ def _tuples_to_cache(tuples, reference):
 
 def cache_bytes(past_key_values, dtype_bytes: int) -> int:
     """Total bytes the KV cache occupies given tensor shapes — lets us state
-    the fp16-vs-int8 cache size directly (2 bytes/elem vs 1), independent of
-    whatever else is contributing to peak-memory noise.
+    the baseline-vs-int8 cache size directly (2 bytes/elem for fp16 or
+    bf16, 1 for int8), independent of whatever else is contributing to
+    peak-memory noise.
     """
     tuples = _cache_to_tuples(past_key_values)
     if not tuples:
@@ -118,9 +126,10 @@ def cache_bytes(past_key_values, dtype_bytes: int) -> int:
 
 
 @torch.no_grad()
-def decode_fp16(model, input_ids: torch.Tensor, num_new_tokens: int):
+def decode_baseline(model, input_ids: torch.Tensor, num_new_tokens: int):
     """Standard decode loop — cache managed entirely by transformers
-    internally, never touched. This is the baseline.
+    internally, never touched. This is the baseline (bf16 by default —
+    see module docstring for why not fp16).
     """
     generated = input_ids
     past = None
@@ -155,8 +164,8 @@ def decode_int8_kv(model, input_ids: torch.Tensor, num_new_tokens: int):
     before each forward call, requantized right after. This measures the
     storage/bandwidth tradeoff honestly, including the dequantization
     compute cost — it does NOT implement an int8-aware attention kernel
-    (attention itself still runs in fp16), so any speed win here is net of
-    that dequant overhead, not a best-case number.
+    (attention itself still runs in the baseline dtype internally), so any
+    speed win here is net of that dequant overhead, not a best-case number.
     """
     generated = input_ids
     past_raw = None   # last raw past_key_values from the model, only kept to know its type
@@ -223,7 +232,7 @@ def run_context_sweep(device: torch.device, prompt_lengths=(32, 128, 512, 1024),
         input_ids = make_prompt(tokenizer, device, prompt_len)
 
         torch.cuda.reset_peak_memory_stats(device)
-        _, per_token_ms, past = decode_fp16(model, input_ids, num_new_tokens)
+        _, per_token_ms, past = decode_baseline(model, input_ids, num_new_tokens)
         peak_mem_gb = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
 
         # Skip the first step (prefill processes the whole prompt at once —
@@ -236,26 +245,26 @@ def run_context_sweep(device: torch.device, prompt_lengths=(32, 128, 512, 1024),
             median_step_ms=median_ms,
             tokens_per_sec=1000.0 / median_ms,
             peak_mem_gb=peak_mem_gb,
-            cache_bytes_fp16=cache_bytes(past, dtype_bytes=2),
+            cache_bytes_baseline=cache_bytes(past, dtype_bytes=2),
         ))
     return results
 
 
-def compare_fp16_vs_int8(device: torch.device, prompt_len: int = 512, num_new_tokens: int = 20):
+def compare_baseline_vs_int8(device: torch.device, prompt_len: int = 512, num_new_tokens: int = 20):
     model, tokenizer = load_model(device)
     input_ids = make_prompt(tokenizer, device, prompt_len)
 
     torch.cuda.reset_peak_memory_stats(device)
-    gen_fp16, ms_fp16, past_fp16 = decode_fp16(model, input_ids.clone(), num_new_tokens)
-    mem_fp16_gb = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
+    gen_base, ms_base, past_base = decode_baseline(model, input_ids.clone(), num_new_tokens)
+    mem_base_gb = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
 
     torch.cuda.reset_peak_memory_stats(device)
     gen_int8, ms_int8, q_cache = decode_int8_kv(model, input_ids.clone(), num_new_tokens)
     mem_int8_gb = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
 
-    new_fp16 = gen_fp16[:, prompt_len:]
+    new_base = gen_base[:, prompt_len:]
     new_int8 = gen_int8[:, prompt_len:]
-    token_match_fraction = (new_fp16 == new_int8).float().mean().item()
+    token_match_fraction = (new_base == new_int8).float().mean().item()
 
     int8_cache_bytes_val = sum(qk.numel() + qv.numel() for qk, _, qv, _ in q_cache) if q_cache else 0
 
@@ -264,11 +273,11 @@ def compare_fp16_vs_int8(device: torch.device, prompt_len: int = 512, num_new_to
         return vals[len(vals) // 2]
 
     return dict(
-        fp16=dict(median_step_ms=_median(ms_fp16), peak_mem_gb=mem_fp16_gb,
-                   cache_bytes=cache_bytes(past_fp16, dtype_bytes=2)),
+        baseline=dict(median_step_ms=_median(ms_base), peak_mem_gb=mem_base_gb,
+                       cache_bytes=cache_bytes(past_base, dtype_bytes=2)),
         int8=dict(median_step_ms=_median(ms_int8), peak_mem_gb=mem_int8_gb,
-                   cache_bytes=int8_cache_bytes_val),
+                  cache_bytes=int8_cache_bytes_val),
         token_match_fraction=token_match_fraction,
-        text_fp16=tokenizer.decode(new_fp16[0], skip_special_tokens=True),
+        text_baseline=tokenizer.decode(new_base[0], skip_special_tokens=True),
         text_int8=tokenizer.decode(new_int8[0], skip_special_tokens=True),
     )
