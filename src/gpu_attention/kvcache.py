@@ -77,18 +77,32 @@ def _cache_to_tuples(past_key_values):
     if past_key_values is None:
         return None
     if hasattr(past_key_values, "to_legacy_cache"):
-        return list(past_key_values.to_legacy_cache())
-    return list(past_key_values)
+        raw = past_key_values.to_legacy_cache()
+    else:
+        raw = list(past_key_values)
+    # Confirmed via diagnostic on transformers 5.14.1: iterating a
+    # DynamicCache directly yields (key, value, None) per layer, not a
+    # clean 2-tuple -- to_legacy_cache() doesn't exist on this version at
+    # all. Keep only the first two elements regardless of how many trail
+    # after them, rather than assuming exactly 2.
+    return [(layer[0], layer[1]) for layer in raw]
 
 
 def _tuples_to_cache(tuples, reference):
-    """Reverses _cache_to_tuples — rebuilds whatever type the model expects,
-    inferred from a reference object of that type (typically the previous
-    step's raw past_key_values).
+    """Reverses _cache_to_tuples — rebuilds whatever type the model expects.
+    transformers 5.x removed both to_legacy_cache() and from_legacy_cache()
+    (confirmed via diagnostic), so the primary path builds a fresh
+    DynamicCache using its own .update() API rather than a legacy
+    constructor. from_legacy_cache is kept as a fallback for older
+    transformers installs this project might run on later.
     """
-    if reference is not None and hasattr(reference, "from_legacy_cache"):
+    if reference is not None and hasattr(type(reference), "from_legacy_cache"):
         return type(reference).from_legacy_cache(tuple(tuples))
-    return tuple(tuples)
+    from transformers.cache_utils import DynamicCache
+    cache = DynamicCache()
+    for layer_idx, (k, v) in enumerate(tuples):
+        cache.update(k, v, layer_idx)
+    return cache
 
 
 def cache_bytes(past_key_values, dtype_bytes: int) -> int:
