@@ -1,4 +1,4 @@
-# Handover Brief — gpu-attention project, state mid-Phase 3
+# Handover Brief — gpu-attention project, state after Phase 4
 
 **For a fresh AI agent (or the human) picking this up without prior context.**
 Repo: `github.com/akashg71/gpu-attention` (public). This doc is a snapshot —
@@ -204,6 +204,55 @@ Reference for next session: `ncu`/`nsys` at `/usr/local/cuda/bin/`. Re-lock
 clocks each session (`sudo nvidia-smi -pm 1 && sudo nvidia-smi -lgc 1590` —
 doesn't survive stop/start).
 
+## Phase 4 — Extension (DONE)
+
+Picked KV-cache decode + int8 KV-cache (over a weight-quantization study),
+specifically because it extends Phase 3's memory-bound story into decode —
+the case that dominates real LLM serving cost — rather than starting a
+disconnected topic. Model: GPT-2-small via `transformers`, manual decode
+loop (`src/gpu_attention/kvcache.py`, `scripts/04_extension.py`).
+
+**A long debugging detour worth knowing about, not just the fix**: the
+first real run hit `CUDA error: device-side assert triggered`. Chased,
+in order — fp16 overflow (switched to bf16, didn't help), fused vs
+unfused `addmm`/cuBLASLt path (`DISABLE_ADDMM_CUDA_LT=1`, didn't help), a
+possibly-corrupted CUDA context (full instance restart, didn't help), a
+degenerate `n=1` GEMM shape from single-sequence decode (batched to 4,
+changed the symptom, not the outcome). All reasonable hypotheses, all
+wrong — CUDA reports these errors **asynchronously**, so the true failure
+kept getting misattributed to whatever unrelated kernel was checked next.
+`CUDA_LAUNCH_BLOCKING=1` (which the error message suggested from the very
+first crash) finally forced synchronous reporting and found the real bug:
+`self.wpe(position_ids)` — GPT-2's positional embedding table has exactly
+1024 rows, and the context sweep's `prompt_lengths` included 1024 combined
+with `num_new_tokens=20`, asking the model to decode past position 1023 —
+architecturally impossible, unrelated to hardware/dtype/GEMM shape
+entirely. **Takeaway for next time a device-side assert shows up: reach
+for `CUDA_LAUNCH_BLOCKING=1` first**, before forming any hypothesis.
+
+**Results** (GPT-2-small, batch=4, bf16):
+- Context sweep: per-token latency rises with context (11.77ms → 13.73ms,
+  prompt_len 32→1000) — right direction, but achieved latency is ~27x the
+  theoretical bandwidth-bound floor even at prompt_len=1000, meaning
+  decode at this model's small scale is dominated by fixed per-step
+  overhead (kernel launch, HF framework layers), not bandwidth yet. The
+  bandwidth component IS growing faster than the fixed one (floor grows
+  20x vs achieved latency's 17%), just doesn't dominate outright at this
+  scale — a bigger model or longer context would show it more starkly.
+- int8 KV-cache: cache size exactly halved (78.3MB→39.1MB, real measured
+  bytes), output quality perfect (100% token match), speed a wash
+  (consistent with the overhead-bound finding, not a separate puzzle).
+  **Peak memory went up, not down** (0.527GB→0.780GB) — the
+  dequantize-every-step implementation needs both the compact int8 cache
+  and a full-size dequantized working copy simultaneously, so the storage
+  saving never becomes a peak-memory saving. Same materialization lesson
+  Phases 0-3 already proved for the attention kernel, recurring here.
+  Real fix needs an int8-aware attention kernel (dequantize inside the
+  kernel, tile by tile) — genuine kernel engineering, correctly out of
+  scope, same boundary as Phase 3's register-pressure fix.
+
+Full narrative: `instructions.md`'s Progress Log, Phase 4 section.
+
 ## Notes for whichever agent picks this up
 
 - **Verify before recommending.** This doc is a snapshot; file paths,
@@ -212,12 +261,6 @@ doesn't survive stop/start).
 - The user is a senior backend engineer, new to CUDA/Triton/GPU profiling —
   comment/explain generously, don't assume familiarity with GPU-specific
   vocabulary (see `concepts.md` for what's already been explained).
-- Phases 0-2 have no open threads as of this writing — both loose ends noted
-  in earlier drafts of this doc (the Phase 1 extended-grid re-run, and the
-  SDPA anomaly) were resolved and are recorded above.
-- Phase 3 is actively in progress, not "next" — three real bugs found and
-  fixed getting the profiling harness working at all (see above), but the
-  actual payoff (real bytes-moved numbers, the roofline plot) hasn't
-  happened yet. Don't report Phase 3 as unstarted or as done — it's
-  mid-flight. The concrete next action is spelled out above; do that
-  before anything else in this phase.
+- Phases 0-4 all have no open threads as of this writing — every loose end
+  noted in earlier drafts of this doc was resolved and is recorded above.
+  Phase 5 (writeup) is next, not started.

@@ -352,7 +352,75 @@ Raw logs from each run: `results/logs/phase3_profile_run1.md`,
 
 ### Phase 4 — Extension
 
-- [ ] Not started. Not yet decided: KV-cache (4a) vs quantization (4b).
+**DONE.** Picked 4a (KV-cache decode + int8 KV-cache), over 4b
+(quantization study), specifically because it extends Phase 3's
+memory-bound story into decode — the case that dominates real LLM serving
+cost — rather than starting a parallel, disconnected topic.
+
+- [x] **Implemented**: manual decode loop over GPT-2 (small, 124M) via
+      `transformers`, instrumented per-step with CUDA events.
+      `src/gpu_attention/kvcache.py` + `scripts/04_extension.py`.
+- [x] **A long, genuinely instructive debugging detour** — recorded in full
+      because the *lesson*, not just the fix, is worth keeping. First real
+      run hit `CUDA error: device-side assert triggered`, preceded by a
+      `CUBLAS_STATUS_EXECUTION_FAILED` warning. Chased, in order: fp16
+      numerical overflow (switched to bf16 — didn't help, hit the same
+      error class), the fused vs unfused `addmm`/cuBLASLt path
+      (`DISABLE_ADDMM_CUDA_LT=1` — didn't help), a possibly-corrupted CUDA
+      context (full instance restart — didn't help), and a degenerate
+      `n=1` GEMM shape from single-sequence decode (batched to 4 sequences
+      — changed the symptom but not the outcome). Every one of these was a
+      *plausible*, reasonably-argued hypothesis given the evidence at the
+      time, and every one was wrong — because CUDA reports device-side
+      assert errors **asynchronously**, so the true failure kept getting
+      misattributed to whatever unrelated kernel (a GEMM, a GELU) happened
+      to be checked next. `CUDA_LAUNCH_BLOCKING=1` (which PyTorch's own
+      error message suggested from the very first crash) finally forced
+      synchronous reporting and revealed the real error:
+      `self.wpe(position_ids)` — GPT-2's positional embedding table has
+      exactly 1024 rows (`max_position_embeddings`), and the sweep's
+      `prompt_lengths` included 1024 combined with `num_new_tokens=20`,
+      asking the model to decode past position 1023 — architecturally
+      impossible for this model, nothing to do with hardware, dtype, or
+      GEMM shape at all. **Lesson for next time a device-side assert shows
+      up: reach for `CUDA_LAUNCH_BLOCKING=1` first, before forming any
+      hypothesis about the cause** — every other lever tested here was
+      irrelevant to the actual bug, and would have stayed irrelevant no
+      matter how many more were tried.
+  - Fixed: capped sweep `prompt_lengths` under the position limit (1024 →
+    1000), and added an explicit `ValueError` guard in both
+    `run_context_sweep` and `compare_baseline_vs_int8` so this fails with
+    a readable Python error instead of a cryptic GPU assert if hit again.
+- [x] **Results** (GPT-2-small, batch=4, bf16 baseline):
+  - **Context-length sweep**: per-token latency rises with context (11.77ms
+    → 13.73ms, prompt_len 32→1000) — right direction, but the gap to the
+    theoretical bandwidth-bound floor (0.025ms → 0.501ms over the same
+    range) shows decode at this model's scale is dominated by **fixed
+    per-step overhead** (kernel launch, HF framework overhead across 12
+    layers), not memory bandwidth — achieved latency is ~27x the
+    bandwidth floor even at prompt_len=1000. The bandwidth-bound story is
+    real (the floor grows 20x while achieved latency only grows 17%, i.e.
+    the bandwidth component is growing far faster than the fixed
+    component) but does not yet dominate at this scale — reporting
+    "decode is memory-bound, full stop" here would overclaim what a 124M
+    model actually shows. Would need a larger model or much longer
+    context for bandwidth to become the dominant term outright.
+  - **int8 KV-cache — two clean wins, one instructive miss**: cache size
+    exactly halved (78.3MB → 39.1MB, ratio 0.50 precisely, real measured
+    bytes not theory); output quality perfect (100% token match, identical
+    generated text); speed a wash (11.95ms vs 11.83ms, within noise —
+    consistent with the overhead-bound finding above, not a separate
+    puzzle). **Peak memory went up, not down** (0.527GB → 0.780GB) —
+    `decode_int8_kv` dequantizes the full cache to bf16 every step to feed
+    the model (no int8-aware attention kernel), so it needs both the
+    compact int8 storage and a full-size dequantized working copy
+    resident simultaneously. The storage saving is real but never becomes
+    a peak-memory saving without dequantization happening inside the
+    attention kernel itself, tile by tile — the exact same
+    materialization lesson Phases 0-3 already proved for the attention
+    kernel, showing up again in a new place. Real fix is genuine kernel
+    engineering (an int8-aware attention path), correctly out of scope
+    here, same boundary as Phase 3's register-pressure fix.
 
 ### Phase 5 — Writeup
 
