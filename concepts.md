@@ -35,9 +35,45 @@ prose.
   a **block** (CTA) is a group of warps scheduled onto one SM.
 - **Occupancy** — how many warps are actually resident on an SM vs its max
   capacity. Low occupancy often means the SM sits idle waiting on memory.
-- **Warp stalls** — the reason a warp isn't issuing an instruction on a given
-  cycle (commonly: waiting on a memory load). `ncu` reports these by category
-  in Phase 3.
+  **Theoretical** occupancy is the best a kernel's resource usage allows
+  *before it even runs* (a ceiling set by registers-per-thread and/or
+  shared-memory-per-block, whichever runs out first); **achieved** occupancy
+  is what actually happened. If achieved ≈ theoretical, the kernel is hitting
+  its own ceiling, not failing to reach a higher one — the ceiling itself is
+  the problem. `ncu`'s Occupancy section states the actual limiter directly
+  (`Block Limit Registers` / `Block Limit Shared Mem` / `Block Limit Warps` —
+  whichever gives the smallest number of concurrent blocks is it) — check
+  that field, don't guess which resource is constraining it.
+- **Warp stalls / "hiding latency"** — a memory read from HBM takes a fixed,
+  physics-level delay (hundreds of cycles) that no kernel can shorten. An SM
+  "hides" that delay by switching to a *different* resident warp that already
+  has work ready, so the SM's execution units are never idle — the wait for
+  warp A is masked by useful work from warp B. This is *why* occupancy
+  matters: with few resident warps, there's often nothing else ready when one
+  stalls, so the wait becomes visible as lost throughput instead of being
+  absorbed. `ncu` reports the specific stall reasons by category (Phase 3
+  found ~53% of stall cycles were warps waiting on the MIO — shared-memory/
+  special-instruction — pipeline being full).
+
+  **Kitchen analogy for the whole chain** (small tiles → low occupancy →
+  can't hide latency → low utilization everywhere → still slow despite doing
+  less "work"): picture 8 identical cooking stations, but only enough
+  counter space stocked for 2 cooks at a time. A **cook** = a warp; **counter
+  space per cook** = registers, the fast private scratch space each warp
+  needs (in the attention kernel: the running max/sum and the whole output
+  accumulator, kept resident for speed). If each cook needs a lot of counter
+  space, only 2 fit even though the station could physically hold 8 — that's
+  a low *theoretical* occupancy, not a bug, just what fits. A cook
+  occasionally needs a pantry trip (a warp waiting on HBM). With 8 cooks,
+  while one's away the other seven keep the station running — latency
+  hidden. With only 2, there's a real chance both are stuck waiting at once,
+  and the station just sits idle — neither cooking (compute idle) nor
+  fetching efficiently (memory idle too), which is exactly the "low DRAM%
+  *and* low Compute% simultaneously" pattern this project measured. A
+  wasteful recipe (more raw ingredients per dish — naive's O(N²) bytes) run
+  by a fully-staffed station can still out-produce a leaner recipe (Triton's
+  O(N) bytes) stuck with only 2 cooks — less efficient per-dish, but rarely
+  idle beats efficient-but-idle.
 
 ### Triton's programming model
 - Triton is a Python-embedded DSL that JIT-compiles to PTX (GPU assembly).

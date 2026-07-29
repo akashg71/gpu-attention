@@ -158,7 +158,12 @@ TFLOP/s flat across the seq_len sweep instead of improving like SDPA's did?).
   → few concurrent thread-blocks per SM → 25% occupancy ceiling →
   insufficient parallelism to hide latency → low utilization on both memory
   and compute → despite moving half the bytes naive does, still loses on
-  wall-clock time.
+  wall-clock time. Plain-English version + kitchen analogy: `concepts.md`.
+  **Not yet confirmed which resource (registers vs shared memory) actually
+  limits occupancy** — inferred from typical FlashAttention register
+  pressure, not verified against `ncu`'s own limiter fields
+  (`Block Limit Registers`/`Block Limit Shared Mem`), which already exist in
+  `results/traces/triton_full_report.txt` and just need grepping for.
 - This is explanation, not a fix — reducing the register pressure is real
   kernel restructuring (candidate future work), deliberately not attempted
   here; out of scope for a profiling phase.

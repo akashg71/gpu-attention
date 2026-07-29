@@ -304,7 +304,14 @@ they were actually hit, not cleaned up in hindsight).
     usage → few concurrent thread-blocks per SM → 25% occupancy ceiling →
     insufficient parallelism to hide memory or compute latency → both
     utilization numbers stay low → despite moving half the bytes naive
-    does, wall-clock time still loses.
+    does, wall-clock time still loses. Plain-English walkthrough + kitchen
+    analogy for this whole chain: `concepts.md`, "Warp stalls / hiding
+    latency." **Not yet confirmed which resource (registers vs shared
+    memory) is the actual occupancy limiter** — inferred from typical
+    FlashAttention-style register pressure, not verified against `ncu`'s
+    own `Block Limit Registers`/`Block Limit Shared Mem` fields, which are
+    already in `results/traces/triton_full_report.txt` and just need
+    grepping for.
   - Caveat: this specific `--set full` run's autotuner picked a *different*
     near-tied config (`BLOCK_N=32, num_stages=2`) than the two lighter
     `--set roofline` runs did (`BLOCK_N=64, num_stages=3`) — both share
