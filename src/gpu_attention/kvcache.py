@@ -11,17 +11,19 @@ kernel here — the point is showing the memory-bound *decode* story
 generalizes past a single hand-written kernel, using a real model's real
 cache, not re-deriving Phases 0-3 inside a bigger model.
 
-Runs in bf16, not fp16, by default. Plain GPT-2 was trained in fp32 without
-the stability tricks newer models use to stay fp16-safe, and hit a real
-CUDA device-side assert in fp16 on this box (preceded by a
-CUBLAS_STATUS_EXECUTION_FAILED warning) — consistent with activation
-overflow, since fp16's max representable value (~65504) is easy to exceed.
-bf16 has fp32's exponent range at the same 2-bytes-per-element size, so no
-overflow risk, at the cost of less mantissa precision. Phase 1 already
-established this T4 lacks native bf16 tensor-core support (Turing, not
-Ampere+) — bf16 still runs correctly here, just without hardware
-acceleration, which is the right trade when the goal is getting a correct
-decode loop working, not maximum throughput.
+Runs in bf16 by default (fp32's exponent range, no overflow risk, at the
+cost of mantissa precision; Phase 1 already established this T4 lacks
+native bf16 tensor-core support, but it still runs correctly, just without
+hardware acceleration). Worth being direct about why, since it took a long
+detour to find: an early run hit a real CUDA device-side assert in fp16,
+which looked like activation overflow and motivated switching to bf16 —
+but bf16 hit the *same* class of error too, which should have been the
+signal that dtype was never the actual cause. The real bug (see
+`run_context_sweep`'s docstring) was a context-length sweep asking GPT-2 to
+decode past its 1024-position architectural limit — entirely unrelated to
+dtype. bf16 is kept as the default regardless since it's still the safer
+general choice, but it did not fix anything in this project's actual
+debugging history, and shouldn't be read as having done so.
 
 Verified against transformers 5.14.1 specifically: `to_legacy_cache()` and
 `from_legacy_cache()` were both removed (not just deprecated) — iterating
@@ -226,19 +228,36 @@ def theoretical_min_step_ms(cache_bytes_total: int, peak_bandwidth_gbps: float) 
     return (cache_bytes_total / (peak_bandwidth_gbps * 1e9)) * 1000
 
 
-def run_context_sweep(device: torch.device, prompt_lengths=(32, 128, 512, 1024), num_new_tokens: int = 20,
+def run_context_sweep(device: torch.device, prompt_lengths=(32, 128, 512, 1000), num_new_tokens: int = 20,
                        batch_size: int = 4):
     """For each starting prompt length: prefill, then decode num_new_tokens,
     reporting median per-token latency and peak memory. Rising per-token
     latency as prompt_lengths grows is the direct evidence decode is
     memory-bandwidth-bound (each step re-reads the whole cache).
 
-    batch_size defaults to 4, not 1 -- see make_prompt's docstring; batch=1
-    decode hit a real CUBLAS_STATUS_EXECUTION_FAILED on this box.
+    GPT-2's positional embedding table has exactly model.config.n_positions
+    (1024) rows -- prompt_len + num_new_tokens must stay under that, or the
+    model is being asked to represent a position it architecturally cannot.
+    That exact overflow (prompt_lengths originally included 1024, plus 20
+    new tokens = position 1024, one past the last valid index 1023) was the
+    real cause of an extended, misleading debugging session: CUDA reports
+    device-side assert errors asynchronously, so the failure kept getting
+    blamed on whatever unrelated kernel (a GEMM, a GELU) happened to be
+    checked next, not the actual embedding lookup that overflowed. Guarded
+    explicitly below so this fails with a clear Python error instead of a
+    cryptic GPU assert if it happens again.
     """
     model, tokenizer = load_model(device)
+    max_pos = model.config.n_positions
     results = []
     for prompt_len in prompt_lengths:
+        if prompt_len + num_new_tokens > max_pos:
+            raise ValueError(
+                f"prompt_len={prompt_len} + num_new_tokens={num_new_tokens} = "
+                f"{prompt_len + num_new_tokens} exceeds this model's max position "
+                f"({max_pos}). GPT-2 cannot represent positions beyond that -- "
+                f"reduce prompt_len or num_new_tokens."
+            )
         input_ids = make_prompt(tokenizer, device, prompt_len, batch_size=batch_size)
 
         torch.cuda.reset_peak_memory_stats(device)
@@ -263,6 +282,11 @@ def run_context_sweep(device: torch.device, prompt_lengths=(32, 128, 512, 1024),
 def compare_baseline_vs_int8(device: torch.device, prompt_len: int = 512, num_new_tokens: int = 20,
                               batch_size: int = 4):
     model, tokenizer = load_model(device)
+    if prompt_len + num_new_tokens > model.config.n_positions:
+        raise ValueError(
+            f"prompt_len={prompt_len} + num_new_tokens={num_new_tokens} exceeds "
+            f"this model's max position ({model.config.n_positions})."
+        )
     input_ids = make_prompt(tokenizer, device, prompt_len, batch_size=batch_size)
 
     torch.cuda.reset_peak_memory_stats(device)
