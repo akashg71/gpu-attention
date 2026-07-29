@@ -306,12 +306,16 @@ they were actually hit, not cleaned up in hindsight).
     utilization numbers stay low → despite moving half the bytes naive
     does, wall-clock time still loses. Plain-English walkthrough + kitchen
     analogy for this whole chain: `concepts.md`, "Warp stalls / hiding
-    latency." **Not yet confirmed which resource (registers vs shared
-    memory) is the actual occupancy limiter** — inferred from typical
-    FlashAttention-style register pressure, not verified against `ncu`'s
-    own `Block Limit Registers`/`Block Limit Shared Mem` fields, which are
-    already in `results/traces/triton_full_report.txt` and just need
-    grepping for.
+    latency."
+  - **Confirmed via `ncu`'s own Occupancy section** (grepped directly from
+    `results/traces/triton_full_report.txt`, not inferred): the steady-state
+    launch (213 registers/thread, 16.38KB dynamic shared memory/block) hits
+    `Block Limit Registers = 2` **and** `Block Limit Shared Mem = 2` —
+    tied, both independently capping at 2 blocks/SM. Verified the register
+    math directly: 65,536 registers/SM ÷ (213 × 128 threads/block) ≈ 2.4,
+    floors to 2 — matches exactly. Registers are the harder of the two
+    (would still cap at 2 blocks even if shared memory weren't a factor),
+    which is what motivated the experiment below.
   - Caveat: this specific `--set full` run's autotuner picked a *different*
     near-tied config (`BLOCK_N=32, num_stages=2`) than the two lighter
     `--set roofline` runs did (`BLOCK_N=64, num_stages=3`) — both share
@@ -321,10 +325,27 @@ they were actually hit, not cleaned up in hindsight).
     candidates. The occupancy/stall story should still be representative
     of the small-tile config family, but isn't a perfect match to the
     exact config behind the roofline numbers above.
-  - **This is explanation, not a fix** — deliberately not attempting to
-    reduce the register pressure now (real kernel restructuring, not a
-    quick tweak) — out of scope for a profiling phase. Noted as candidate
-    future work, not pursued.
+- [x] **Experiment: `maxnreg`-capped configs to test the register-limited
+      finding directly — negative result.** Added 3 `maxnreg=128` config
+      candidates (commit `1ce23a3`) to let autotuning empirically test
+      whether capping registers (trading per-thread scratch space for more
+      concurrent blocks) improves speed. Re-ran the full seq_len sweep:
+      **no meaningful change anywhere** — seq_len=2048 (the profiled shape)
+      went from 12.487-12.498ms to 12.528ms, well within existing run-to-run
+      noise, and seq_len=8192 got slightly *worse* (205ms vs ~197ms).
+      Autotuning almost certainly tried and rejected the new configs.
+  - **Why it likely didn't help**: occupancy and the dominant stall reason
+    found earlier (MIO pipeline pressure, ~53% of stall cycles — see above)
+    are *different* bottlenecks that produced a similar-looking symptom.
+    MIO pressure is about contention on the shared-memory-access pipeline
+    itself, not how many warps are available to use it — more resident
+    warps competing for that same limited pipeline can leave things flat or
+    even slightly worse (consistent with the 8192 regression), not better.
+  - **Refined conclusion**: the real fix is restructuring the kernel's
+    inner loop to do fewer, wider memory loads (Nsight's own suggestion),
+    not a tuning-level change — genuine kernel engineering, correctly left
+    out of scope. Configs left in `_CONFIGS` as a documented, honest
+    negative result rather than reverted.
 
 Raw logs from each run: `results/logs/phase3_profile_run1.md`,
 `phase3_profile_run2.md`, `phase_3_profile_full_run1.md`.
