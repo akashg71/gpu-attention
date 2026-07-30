@@ -91,7 +91,7 @@ hasn't kicked in — untested).
 met.
 
 ### Phase 1 — Correct kernel
-BankLogin!3akash
+
 - [x] **Implement and run the correctness sweep** (Section 4.2: seq_len,
       head_dim, batch, causal on/off, fp16/bf16)
   - Grid: `seq_len ∈ {128, 512, 1024, 2048, 4096}`, `head_dim ∈ {64, 128}`,
